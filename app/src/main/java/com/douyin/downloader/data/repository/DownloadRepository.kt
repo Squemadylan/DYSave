@@ -148,7 +148,7 @@ class DownloadRepository @Inject constructor(
         val sb = StringBuilder()
         sb.append("-y -loop 1 -i $imgPath ")
         if (musicPath != null) sb.append("-i $musicPath ")
-        sb.append("-c:v libx264 -tune stillimage -c:a aac -b:a 192k -pix_fmt yuv420p ")
+        sb.append("-c:v libopenh264 -c:a aac -b:a 192k -pix_fmt yuv420p ")
         sb.append("-t $duration -shortest $outputPath")
         return sb.toString()
     }
@@ -173,7 +173,7 @@ class DownloadRepository @Inject constructor(
         val sb = StringBuilder()
         sb.append("-y -f concat -safe 0 -i ${concatFile.absolutePath} ")
         if (musicPath != null) sb.append("-i $musicPath ")
-        sb.append("-c:v libx264 -pix_fmt yuv420p -c:a aac -b:a 192k ")
+        sb.append("-c:v libopenh264 -pix_fmt yuv420p -c:a aac -b:a 192k ")
         sb.append("-t $duration -shortest $outputPath")
         return sb.toString()
     }

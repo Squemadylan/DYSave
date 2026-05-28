@@ -14,8 +14,11 @@ android {
         applicationId = "com.douyin.downloader"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 4
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+        }
+        versionName = "1.0.4"
     }
 
     buildTypes {
@@ -39,6 +42,12 @@ android {
 
     buildFeatures {
         compose = true
+    }
+
+    packaging {
+        jniLibs {
+            pickFirsts += "**/libc++_shared.so"
+        }
     }
 }
 
@@ -77,8 +86,8 @@ dependencies {
     implementation("androidx.media3:media3-exoplayer:1.6.0")
     implementation("androidx.media3:media3-ui:1.6.0")
 
-    // FFmpegKit (from JitPack, v4.5.1.LTS is the latest available version)
-    implementation("com.github.arthenica:ffmpeg-kit:v4.5.1.LTS")
+    // FFmpegKit (community repackaged with native .so libraries, 16KB page-aligned)
+    implementation("com.moizhassan.ffmpeg:ffmpeg-kit-16kb:6.1.1")
 
     // WorkManager
     implementation("androidx.work:work-runtime-ktx:2.10.1")

@@ -8,6 +8,8 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -29,6 +31,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Button
@@ -37,6 +40,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -100,7 +104,7 @@ fun HomeScreen(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(padding),
+                .padding(bottom = padding.calculateBottomPadding()),
         ) {
             Column(
                 modifier = Modifier
@@ -109,7 +113,7 @@ fun HomeScreen(
             ) {
                 // Title
                 Text(
-                    text = "媒体解析器",
+                    text = "轻载",
                     style = MaterialTheme.typography.headlineMedium,
                 )
                 Spacer(modifier = Modifier.height(20.dp))
@@ -131,6 +135,17 @@ fun HomeScreen(
                                 contentDescription = null,
                                 tint = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
+                        },
+                        trailingIcon = {
+                            if (state.inputUrl.isNotEmpty()) {
+                                IconButton(onClick = { viewModel.onUrlChanged("") }) {
+                                    Icon(
+                                        imageVector = Icons.Default.Close,
+                                        contentDescription = "清除",
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
                         },
                         singleLine = true,
                         shape = RoundedCornerShape(16.dp),
@@ -269,7 +284,7 @@ private fun ResultContent(
 
 @Composable
 private fun VideoResult(info: ContentInfo.Video, onDownload: () -> Unit) {
-    Column {
+    Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
         CoverImage(cover = info.cover, modifier = Modifier.fillMaxWidth())
         Spacer(modifier = Modifier.height(12.dp))
         if (info.author.isNotEmpty()) {
@@ -294,7 +309,7 @@ private fun VideoResult(info: ContentInfo.Video, onDownload: () -> Unit) {
 
 @Composable
 private fun AnimatedVideoResult(info: ContentInfo.Animated, onDownload: () -> Unit) {
-    Column {
+    Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
         CoverImage(cover = info.cover, modifier = Modifier.fillMaxWidth())
         Spacer(modifier = Modifier.height(12.dp))
         if (info.author.isNotEmpty()) {
