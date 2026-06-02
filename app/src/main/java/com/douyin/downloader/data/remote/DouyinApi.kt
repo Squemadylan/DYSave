@@ -18,6 +18,11 @@ class DouyinApi @Inject constructor(private val client: OkHttpClient) {
             "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) " +
                 "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 " +
                 "Mobile/15E148 Safari/604.1"
+        // 兜底 UA：iOS 被风控时换 Android UA 再试一次
+        private const val USER_AGENT_ANDROID =
+            "Mozilla/5.0 (Linux; Android 13; Pixel 7) " +
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 " +
+                "Mobile Safari/537.36"
         private const val REFERER = "https://www.douyin.com/"
 
         /**
@@ -113,14 +118,60 @@ class DouyinApi @Inject constructor(private val client: OkHttpClient) {
     }
 
     suspend fun fetchPage(url: String): String = withContext(Dispatchers.IO) {
+        // 抖音 WAF 概率性拦截：3 次重试，第 2 次换 Android UA 兜底
+        // attempt: 0=iOS, 1=Android(等 800ms), 2=iOS(等 1500ms)
+        val backoffsMs = longArrayOf(0L, 800L, 1500L)
+        val uas = arrayOf(USER_AGENT, USER_AGENT_ANDROID, USER_AGENT)
+        var lastError: Exception? = null
+        for (attempt in backoffsMs.indices) {
+            if (backoffsMs[attempt] > 0L) {
+                kotlinx.coroutines.delay(backoffsMs[attempt])
+            }
+            try {
+                val html = fetchPageOnce(url, uas[attempt])
+                if (attempt > 0) {
+                    android.util.Log.d(
+                        "DouyinApi",
+                        "fetchPage 重试成功 attempt=${attempt + 1} ua=${
+                            if (uas[attempt] == USER_AGENT) "iOS" else "Android"
+                        } url=$url",
+                    )
+                }
+                return@withContext html
+            } catch (e: ParseException.PageFetchFailed) {
+                lastError = e
+                android.util.Log.w(
+                    "DouyinApi",
+                    "fetchPage 失败 attempt=${attempt + 1}/${backoffsMs.size} ua=${
+                        if (uas[attempt] == USER_AGENT) "iOS" else "Android"
+                    } url=$url err=${e.message}",
+                )
+            }
+        }
+        throw lastError ?: ParseException.PageFetchFailed("页面加载失败")
+    }
+
+    private fun fetchPageOnce(url: String, userAgent: String): String {
         val request = Request.Builder()
             .url(url)
-            .header("User-Agent", USER_AGENT)
+            .header("User-Agent", userAgent)
             .header("Referer", REFERER)
             .build()
         client.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) throw ParseException.PageFetchFailed("页面加载失败，HTTP ${response.code}，链接可能已失效")
-            response.body?.string() ?: throw ParseException.PageFetchFailed("页面返回内容为空")
+            if (!response.isSuccessful) {
+                throw ParseException.PageFetchFailed("页面加载失败，HTTP ${response.code}，链接可能已失效")
+            }
+            val html = response.body?.string() ?: throw ParseException.PageFetchFailed("页面返回内容为空")
+            // 调试 log：标记命中/失败
+            val hasRouter = html.contains("_ROUTER_DATA")
+            val hasWaf = html.contains("WAFJS") || html.contains("out-sha256")
+            android.util.Log.d(
+                "DouyinApi",
+                "fetchPage url=$url ua=${
+                    if (userAgent == USER_AGENT) "iOS" else "Android"
+                } len=${html.length} _ROUTER_DATA=$hasRouter waf=$hasWaf",
+            )
+            return html
         }
     }
 
