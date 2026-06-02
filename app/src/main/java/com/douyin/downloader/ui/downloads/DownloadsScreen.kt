@@ -1,5 +1,8 @@
 package com.douyin.downloader.ui.downloads
 
+import android.content.Intent
+import android.net.Uri
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -19,6 +22,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -27,24 +31,58 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.core.content.FileProvider
 import com.douyin.downloader.data.local.DownloadTaskEntity
-import com.douyin.downloader.ui.home.HomeViewModel
+import com.douyin.downloader.data.repository.DownloadManager
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
 @Composable
-fun DownloadsScreen(viewModel: HomeViewModel) {
+fun DownloadsScreen(viewModel: DownloadCenterViewModel) {
     val state by viewModel.uiState.collectAsState()
-    val activeTasks = state.downloadTasks
-    val history = state.downloadHistory
+    val activeTasks = state.activeTasks
+    val history = state.history
+    var showClearConfirm by remember { mutableStateOf(false) }
+
+    if (showClearConfirm) {
+        AlertDialog(
+            onDismissRequest = { showClearConfirm = false },
+            title = { Text("清空下载历史？") },
+            text = {
+                Text(
+                    "将删除全部 ${history.size} 条下载记录。\n" +
+                        "已下载到本机的文件不会被删除。",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showClearConfirm = false
+                    viewModel.onClearDownloadHistory()
+                }) {
+                    Text("清空", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showClearConfirm = false }) {
+                    Text("取消")
+                }
+            },
+        )
+    }
 
     Column(
         modifier = Modifier
@@ -62,10 +100,10 @@ fun DownloadsScreen(viewModel: HomeViewModel) {
                 style = MaterialTheme.typography.headlineMedium,
             )
             if (history.isNotEmpty()) {
-                IconButton(onClick = { viewModel.onClearDownloadHistory() }) {
+                IconButton(onClick = { showClearConfirm = true }) {
                     Icon(
                         imageVector = Icons.Default.Delete,
-                        contentDescription = "清空记录",
+                        contentDescription = "清空历史",
                         tint = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
@@ -118,7 +156,7 @@ fun DownloadsScreen(viewModel: HomeViewModel) {
 }
 
 @Composable
-private fun ActiveTaskCard(task: HomeViewModel.DownloadTask) {
+private fun ActiveTaskCard(task: DownloadManager.Task) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(16.dp),
@@ -133,14 +171,14 @@ private fun ActiveTaskCard(task: HomeViewModel.DownloadTask) {
             verticalAlignment = Alignment.CenterVertically,
         ) {
             when (task.status) {
-                HomeViewModel.TaskStatus.PENDING,
-                HomeViewModel.TaskStatus.DOWNLOADING -> {
+                DownloadManager.Status.PENDING,
+                DownloadManager.Status.DOWNLOADING -> {
                     CircularProgressIndicator(
                         modifier = Modifier.size(40.dp),
                         strokeWidth = 3.dp,
                     )
                 }
-                HomeViewModel.TaskStatus.DONE -> {
+                DownloadManager.Status.DONE -> {
                     Icon(
                         imageVector = Icons.Default.CheckCircle,
                         contentDescription = null,
@@ -148,7 +186,7 @@ private fun ActiveTaskCard(task: HomeViewModel.DownloadTask) {
                         modifier = Modifier.size(40.dp),
                     )
                 }
-                HomeViewModel.TaskStatus.ERROR -> {
+                DownloadManager.Status.ERROR -> {
                     Icon(
                         imageVector = Icons.Default.Warning,
                         contentDescription = null,
@@ -169,7 +207,7 @@ private fun ActiveTaskCard(task: HomeViewModel.DownloadTask) {
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 when (task.status) {
-                    HomeViewModel.TaskStatus.DOWNLOADING -> {
+                    DownloadManager.Status.DOWNLOADING -> {
                         if (task.progress != null) {
                             LinearProgressIndicator(
                                 progress = { task.progress },
@@ -191,7 +229,7 @@ private fun ActiveTaskCard(task: HomeViewModel.DownloadTask) {
                             )
                         }
                     }
-                    HomeViewModel.TaskStatus.PENDING -> {
+                    DownloadManager.Status.PENDING -> {
                         Text(
                             text = "等待中",
                             style = MaterialTheme.typography.bodySmall,
@@ -207,8 +245,16 @@ private fun ActiveTaskCard(task: HomeViewModel.DownloadTask) {
 
 @Composable
 private fun HistoryTaskCard(entity: DownloadTaskEntity) {
+    val context = LocalContext.current
+
     Card(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(
+                if (entity.uri != null) Modifier.clickable {
+                    openDownload(context, entity)
+                } else Modifier
+            ),
         shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
@@ -256,7 +302,7 @@ private fun HistoryTaskCard(entity: DownloadTaskEntity) {
                     )
                 } else {
                     Text(
-                        text = "已完成",
+                        text = if (entity.uri != null) "点击打开" else "已完成",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -289,5 +335,36 @@ private fun formatTimeAgo(timestamp: Long): String {
             val sdf = SimpleDateFormat("MM/dd", Locale.getDefault())
             sdf.format(Date(timestamp))
         }
+    }
+}
+
+/**
+ * 打开历史下载。优先用 file:// 解析回真实文件，转成 FileProvider 的 content://，
+ * 避免 Android 7+ StrictMode 的 FileUriExposedException 闪退。
+ */
+private fun openDownload(context: android.content.Context, entity: DownloadTaskEntity) {
+    val rawUri = entity.uri ?: return
+    val mime = entity.mimeType ?: "video/mp4"
+    try {
+        val uri = Uri.parse(rawUri)
+        val shareable: Uri = if (uri.scheme == "file") {
+            val path = uri.path ?: return
+            val file = File(path)
+            if (!file.exists()) return
+            FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.fileprovider",
+                file,
+            )
+        } else {
+            uri
+        }
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(shareable, mime)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        context.startActivity(intent)
+    } catch (_: Exception) {
+        // 静默失败：没装可处理该 mime 的 app 时也避免崩溃
     }
 }

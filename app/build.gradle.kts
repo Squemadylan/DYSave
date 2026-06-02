@@ -42,6 +42,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     packaging {
@@ -97,4 +98,15 @@ dependencies {
 
     // Core
     implementation("androidx.core:core-ktx:1.16.0")
+
+    // DataStore（设置项持久化）
+    implementation("androidx.datastore:datastore-preferences:1.1.1")
+
+    // Security (EncryptedSharedPreferences for token storage)
+    implementation("androidx.security:security-crypto:1.1.0-alpha06")
+
+    // Douyin OpenSDK (OAuth 登录 + 开放平台 API)
+    val openSdkVersion = "0.2.0.9"
+    implementation("com.bytedance.ies.ugc.aweme:opensdk-china-external:$openSdkVersion")
+    implementation("com.bytedance.ies.ugc.aweme:opensdk-common:$openSdkVersion")
 }

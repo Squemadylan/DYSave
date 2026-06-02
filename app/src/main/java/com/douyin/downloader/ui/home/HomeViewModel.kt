@@ -1,28 +1,45 @@
 package com.douyin.downloader.ui.home
 
+import android.content.Context
+import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import com.douyin.downloader.data.local.DownloadTaskDao
-import com.douyin.downloader.data.local.DownloadTaskEntity
 import com.douyin.downloader.data.local.HistoryDao
 import com.douyin.downloader.data.local.HistoryEntity
+import com.douyin.downloader.data.local.SettingsRepository
+import com.douyin.downloader.data.local.StoragePermissionState
 import com.douyin.downloader.data.model.ContentInfo
+import com.douyin.downloader.data.model.VideoQuality
+import com.douyin.downloader.data.repository.DownloadManager
 import com.douyin.downloader.domain.usecase.DownloadImagesUseCase
 import com.douyin.downloader.domain.usecase.DownloadVideoUseCase
 import com.douyin.downloader.domain.usecase.ParseUrlUseCase
 import com.douyin.downloader.domain.usecase.SynthesizeVideoUseCase
+import com.douyin.downloader.util.TitleFormatter
 import dagger.hilt.android.lifecycle.HiltViewModel
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import org.json.JSONArray
-import java.util.concurrent.atomic.AtomicLong
 import javax.inject.Inject
 
+/**
+ * 主页 ViewModel：负责链接解析 + 当前内容选择（清晰度 / 多选图）。
+ * **不再**承担下载执行 / 历史 / 任务编排 —— 这些下放给 [DownloadCenterViewModel]，
+ * 下载入口通过 [DownloadManager]（@Singleton 服务层）统一调度。
+ */
 @HiltViewModel
 class HomeViewModel @Inject constructor(
     private val parseUrlUseCase: ParseUrlUseCase,
@@ -30,18 +47,39 @@ class HomeViewModel @Inject constructor(
     private val downloadImagesUseCase: DownloadImagesUseCase,
     private val synthesizeVideoUseCase: SynthesizeVideoUseCase,
     private val historyDao: HistoryDao,
-    private val downloadTaskDao: DownloadTaskDao,
+    private val storagePermission: StoragePermissionState,
+    private val downloadManager: DownloadManager,
+    private val settingsRepository: SettingsRepository,
+    @ApplicationContext private val appContext: Context,
 ) : ViewModel() {
 
-    enum class TaskStatus { PENDING, DOWNLOADING, DONE, ERROR }
-
-    data class DownloadTask(
-        val id: Long,
-        val name: String,
-        val status: TaskStatus,
-        val progress: Float? = null,
-        val error: String? = null,
+    /** 用户设置：清晰度偏好 / 并发数 / 子目录。 */
+    val settings = settingsRepository.flow.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5_000),
+        initialValue = SettingsRepository.Settings(),
     )
+
+    // UiEvent 已废弃：跳转系统设置由 ViewModel 直接处理，避免 Hilt EntryPoint
+    // 在 Composable 文件里被 KSP 漏处理（ClassCastException on Android 15）。
+    @Deprecated("No longer emitted; ViewModel handles permission request directly.")
+    sealed interface UiEvent {
+        data object RequestStoragePermission : UiEvent
+    }
+
+    /**
+     * 批量解析后的单条结果。携带 rawUrl 作 id 方便勾选映射，
+     * 失败项只保留错误信息，不影响其他项展示。
+     */
+    data class BatchItem(
+        val id: String,
+        val rawUrl: String,
+        val status: Status,
+        val contentInfo: ContentInfo? = null,
+        val error: String? = null,
+    ) {
+        enum class Status { OK, FAILED }
+    }
 
     data class UiState(
         val inputUrl: String = "",
@@ -51,16 +89,27 @@ class HomeViewModel @Inject constructor(
         val contentInfo: ContentInfo? = null,
         val galleryIndex: Int = 0,
         val selectedImages: Set<Int> = emptySet(),
+        val selectedQualityIndex: Int = 0,
         val history: List<HistoryEntity> = emptyList(),
-        val downloadTasks: List<DownloadTask> = emptyList(),
-        val downloadHistory: List<DownloadTaskEntity> = emptyList(),
+        // ---- 批量下载 ----
+        val batchInput: String = "",
+        val batchItems: List<BatchItem> = emptyList(),
+        val batchSelectedIds: Set<String> = emptySet(),
+        val batchIsParsing: Boolean = false,
+        val batchParseMessage: String = "",
     )
 
     private val _uiState = MutableStateFlow(UiState())
     val uiState: StateFlow<UiState> = _uiState.asStateFlow()
 
-    private val taskIdCounter = AtomicLong(0)
-    private val downloadSemaphore = Semaphore(2)
+    private val _events = Channel<UiEvent>(Channel.BUFFERED)
+    val events = _events.receiveAsFlow()
+
+    /**
+     * 挂起的下载：用户在无权限状态点击下载时，把意图暂存；授权回来时由
+     * [onPermissionResumed] 重放。
+     */
+    private var pendingDownload: (suspend () -> Unit)? = null
 
     init {
         viewModelScope.launch {
@@ -68,12 +117,9 @@ class HomeViewModel @Inject constructor(
                 _uiState.update { it.copy(history = items) }
             }
         }
-        viewModelScope.launch {
-            downloadTaskDao.getRecent().collect { items ->
-                _uiState.update { it.copy(downloadHistory = items) }
-            }
-        }
     }
+
+    // ---------- 解析与选择 ----------
 
     fun onUrlChanged(url: String) {
         _uiState.update { it.copy(inputUrl = url, error = null) }
@@ -88,7 +134,9 @@ class HomeViewModel @Inject constructor(
         val url = _uiState.value.inputUrl.trim()
         if (url.isEmpty()) return
 
-        _uiState.update { it.copy(isLoading = true, loadingMessage = "正在解析...", error = null, contentInfo = null) }
+        _uiState.update {
+            it.copy(isLoading = true, loadingMessage = "正在解析...", error = null, contentInfo = null)
+        }
 
         viewModelScope.launch {
             try {
@@ -99,49 +147,17 @@ class HomeViewModel @Inject constructor(
                         contentInfo = info,
                         galleryIndex = 0,
                         selectedImages = getImages(info).indices.toSet(),
+                        selectedQualityIndex = 0,
                     )
                 }
                 addToHistory(info)
             } catch (e: Exception) {
+                val msg = e.message ?: "解析失败，请检查链接是否有效"
+                val parseEx = if (e is com.douyin.downloader.data.model.ParseException) e else null
                 _uiState.update {
-                    it.copy(isLoading = false, error = e.message ?: "解析失败")
+                    it.copy(isLoading = false, error = parseEx?.message ?: msg)
                 }
             }
-        }
-    }
-
-    private fun enqueueDownload(name: String, block: suspend (taskId: Long) -> Unit) {
-        val id = taskIdCounter.incrementAndGet()
-        val task = DownloadTask(id = id, name = name, status = TaskStatus.PENDING)
-        _uiState.update { it.copy(downloadTasks = it.downloadTasks + task) }
-
-        viewModelScope.launch {
-            downloadSemaphore.withPermit {
-                updateTask(id) { it.copy(status = TaskStatus.DOWNLOADING) }
-                try {
-                    block(id)
-                    updateTask(id) { it.copy(status = TaskStatus.DONE, progress = 1f) }
-                    downloadTaskDao.insert(DownloadTaskEntity(name = name, status = "DONE"))
-                    removeTask(id)
-                } catch (e: Exception) {
-                    updateTask(id) { it.copy(status = TaskStatus.ERROR, error = e.message) }
-                    downloadTaskDao.insert(DownloadTaskEntity(name = name, status = "ERROR", error = e.message))
-                }
-            }
-        }
-    }
-
-    private fun updateTask(id: Long, transform: (DownloadTask) -> DownloadTask) {
-        _uiState.update { state ->
-            state.copy(downloadTasks = state.downloadTasks.map {
-                if (it.id == id) transform(it) else it
-            })
-        }
-    }
-
-    private fun removeTask(id: Long) {
-        _uiState.update { state ->
-            state.copy(downloadTasks = state.downloadTasks.filterNot { it.id == id })
         }
     }
 
@@ -165,25 +181,48 @@ class HomeViewModel @Inject constructor(
         }
     }
 
-    fun onDownloadVideo() {
-        val info = _uiState.value.contentInfo
-        val videoUrl = when (info) {
-            is ContentInfo.Video -> info.videoUrl
-            is ContentInfo.Animated -> info.videoUrl
-            else -> return
+    fun onQualitySelected(index: Int) {
+        _uiState.update { it.copy(selectedQualityIndex = index) }
+    }
+
+    fun getSelectedVideoUrl(): String {
+        val info = _uiState.value.contentInfo ?: return ""
+        val qualities = when (info) {
+            is ContentInfo.Video -> info.qualities
+            is ContentInfo.Animated -> info.qualities
+            else -> emptyList()
         }
+        if (qualities.isEmpty()) {
+            return when (info) {
+                is ContentInfo.Video -> info.videoUrl
+                is ContentInfo.Animated -> info.videoUrl
+                else -> ""
+            }
+        }
+        val userIdx = _uiState.value.selectedQualityIndex
+        val preference = settings.value.defaultQuality
+        val idx = when (preference) {
+            SettingsRepository.DefaultQuality.Auto ->
+                if (userIdx in qualities.indices) userIdx else 0
+            SettingsRepository.DefaultQuality.Highest -> qualities.lastIndex
+            SettingsRepository.DefaultQuality.Lowest -> 0
+        }.coerceIn(0, qualities.size - 1)
+        return qualities[idx].url
+    }
+
+    // ---------- 下载入口（投递意图到 DownloadManager）----------
+
+    fun onDownloadVideo() {
+        val info = _uiState.value.contentInfo ?: return
+        val videoUrl = getSelectedVideoUrl()
         if (videoUrl.isEmpty()) return
 
-        val filename = when (info) {
-            is ContentInfo.Video -> "douyin_${info.id}.mp4"
-            is ContentInfo.Animated -> "douyin_${info.id}.mp4"
-            else -> "douyin_video.mp4"
-        }
-        enqueueDownload("下载视频") { taskId ->
+        val stem = TitleFormatter.formatFilenameStem(info.author, info.title)
+        val filename = "$stem.mp4"
+        val displayName = TitleFormatter.formatDisplayName(info.author, info.title)
+        submit(displayName, "video/mp4") { _, onProgress ->
             downloadVideoUseCase(videoUrl, filename) { downloaded, total ->
-                if (total != null) {
-                    updateTask(taskId) { it.copy(progress = downloaded.toFloat() / total) }
-                }
+                if (total != null) onProgress(downloaded, total)
             }
         }
     }
@@ -193,10 +232,16 @@ class HomeViewModel @Inject constructor(
         val images = getImages(state.contentInfo)
         if (images.isEmpty()) return
         val url = images[state.galleryIndex]
-        val id = getContentId(state.contentInfo)
-
-        enqueueDownload("下载图片") {
-            downloadImagesUseCase.downloadSingle(url, "douyin_${id}_${state.galleryIndex + 1}.jpg")
+        val info = state.contentInfo
+        val stem = TitleFormatter.formatFilenameStem(info?.author.orEmpty(), info?.title.orEmpty())
+        val filename = "${stem}_图${state.galleryIndex + 1}.jpg"
+        val displayName = TitleFormatter.formatDisplayName(
+            author = info?.author.orEmpty(),
+            title = info?.title.orEmpty(),
+            suffix = "_图${state.galleryIndex + 1}",
+        )
+        submit(displayName, "image/*") { _, _ ->
+            downloadImagesUseCase.downloadSingle(url, filename)
         }
     }
 
@@ -207,13 +252,23 @@ class HomeViewModel @Inject constructor(
         val selected = state.selectedImages.sorted()
         if (selected.isEmpty()) return
         val urls = selected.map { images[it] }
-        val filenames = selected.map { "douyin_${getContentId(state.contentInfo)}_${it + 1}.jpg" }
         val total = urls.size
 
-        enqueueDownload("下载图片 $total 张") { taskId ->
-            downloadImagesUseCase.downloadMultiple(urls, filenames) { completed, _ ->
-                updateTask(taskId) { it.copy(progress = completed.toFloat() / total) }
+        val info = _uiState.value.contentInfo
+        val stem = TitleFormatter.formatFilenameStem(info?.author.orEmpty(), info?.title.orEmpty())
+        val filenames = selected.map { "${stem}_图${it + 1}.jpg" }
+
+        val displayName = TitleFormatter.formatDisplayName(
+            author = info?.author.orEmpty(),
+            title = info?.title.orEmpty(),
+            suffix = "_${total}张图",
+        )
+        submit(displayName, "image/*") { _, onProgress ->
+            val uris = downloadImagesUseCase.downloadMultiple(urls, filenames) { completed, _ ->
+                val fraction = completed.toFloat() / total
+                onProgress((fraction * 1000).toLong(), 1000)
             }
+            uris.firstOrNull()
         }
         _uiState.update { it.copy(selectedImages = emptySet()) }
     }
@@ -233,21 +288,294 @@ class HomeViewModel @Inject constructor(
             is ContentInfo.Animated -> info.duration
             else -> 0
         }
-        val id = getContentId(info)
 
-        enqueueDownload("合成视频") {
-            synthesizeVideoUseCase.fromImages(images, musicUrl, duration, "douyin_${id}.mp4")
+        val stem = TitleFormatter.formatFilenameStem(info?.author.orEmpty(), info?.title.orEmpty())
+        val filename = "${stem}_合成.mp4"
+        val displayName = TitleFormatter.formatDisplayName(
+            author = info?.author.orEmpty(),
+            title = info?.title.orEmpty(),
+            suffix = "_合成",
+        )
+        submit(displayName, "video/mp4") { _, _ ->
+            synthesizeVideoUseCase.fromImages(images, musicUrl, duration, filename)
         }
     }
 
     fun onMergeAnimatedVideo() {
         val info = _uiState.value.contentInfo as? ContentInfo.Animated ?: return
-        if (info.videoUrl.isEmpty()) return
+        val videoUrl = getSelectedVideoUrl().ifEmpty { info.videoUrl }
+        if (videoUrl.isEmpty()) return
 
-        enqueueDownload("合并音乐") {
-            synthesizeVideoUseCase.mergeWithMusic(info.videoUrl, info.musicUrl, "douyin_${info.id}.mp4")
+        val stem = TitleFormatter.formatFilenameStem(info.author, info.title)
+        val filename = "${stem}_合并.mp4"
+        val displayName = TitleFormatter.formatDisplayName(
+            author = info.author,
+            title = info.title,
+            suffix = "_合并",
+        )
+        submit(displayName, "video/mp4") { _, _ ->
+            synthesizeVideoUseCase.mergeWithMusic(videoUrl, info.musicUrl, filename)
         }
     }
+
+    // ---------- 批量解析 + 批量下载 ----------
+
+    fun onBatchInputChanged(text: String) {
+        _uiState.update { it.copy(batchInput = text) }
+    }
+
+    /**
+     * 解析批量输入。策略：
+     * 1. 把整段输入按行切，每行再用一个 URL 正则抽 `http(s)://...`；
+     *    这样支持直接粘贴「抖音分享长文本」也支持一行一个 URL；
+     * 2. 跳过空行 / 注释行（以 # 开头）；
+     * 3. 并发解析（最多 3 个并发），单条失败不影响其他；
+     * 4. 解析成功时调用现有 addToHistory 入历史；
+     * 5. 列表 key 用「aweme_id（成功项）/ 原文+序号（失败项）」保证唯一。
+     */
+    fun onBatchParse() {
+        val raw = _uiState.value.batchInput
+        val urls = extractUrls(raw)
+        if (urls.isEmpty()) {
+            _uiState.update {
+                it.copy(error = "未识别到链接，请确认已粘贴抖音视频链接")
+            }
+            return
+        }
+
+        _uiState.update {
+            it.copy(
+                batchIsParsing = true,
+                batchParseMessage = "正在解析 0/${urls.size}...",
+                batchItems = emptyList(),
+                batchSelectedIds = emptySet(),
+                error = null,
+            )
+        }
+
+        viewModelScope.launch {
+            val results = coroutineScope {
+                val semaphore = Semaphore(permits = 3)
+                val done = java.util.concurrent.atomic.AtomicInteger(0)
+                urls.mapIndexed { index, url ->
+                    async {
+                        semaphore.withPermit {
+                            val item = try {
+                                val info = parseUrlUseCase(url)
+                                addToHistory(info)
+                                // 成功项：id 用 aweme_id，重复粘贴同一视频不会冲突
+                                BatchItem(
+                                    id = "${info.id}#$index",
+                                    rawUrl = url,
+                                    status = BatchItem.Status.OK,
+                                    contentInfo = info,
+                                )
+                            } catch (e: Exception) {
+                                // 失败项：用 index 保证 key 唯一（即使两条 rawUrl 一样）
+                                BatchItem(
+                                    id = "failed#$index",
+                                    rawUrl = url,
+                                    status = BatchItem.Status.FAILED,
+                                    error = e.message ?: "解析失败",
+                                )
+                            }
+                            val n = done.incrementAndGet()
+                            _uiState.update {
+                                it.copy(batchParseMessage = "正在解析 $n/${urls.size}...")
+                            }
+                            item
+                        }
+                    }
+                }.awaitAll()
+            }
+            val ok = results.count { it.status == BatchItem.Status.OK }
+            val fail = results.size - ok
+            // 去重：相同 aweme_id 只保留第一条
+            val deduped = mutableListOf<BatchItem>()
+            val seen = mutableSetOf<String>()
+            for (item in results) {
+                val key = (item.contentInfo?.id) ?: item.rawUrl
+                if (seen.add(key)) deduped.add(item)
+            }
+            _uiState.update {
+                it.copy(
+                    batchIsParsing = false,
+                    batchParseMessage = if (fail == 0) "全部解析完成（$ok/${results.size}）"
+                    else "完成：$ok 成功，$fail 失败",
+                    batchItems = deduped,
+                    batchSelectedIds = deduped
+                        .filter { it.status == BatchItem.Status.OK }
+                        .map { it.id }
+                        .toSet(),
+                )
+            }
+        }
+    }
+
+    companion object {
+        private val URL_REGEX = Regex("""https?://[A-Za-z0-9\-._~:/?#@!$&'()*+,;=%]+""")
+
+        /**
+         * 从混合文本中抽取 URL：
+         * 1. 先按行切；空行 / # 注释行跳过；
+         * 2. 每行再用正则抽 URL（支持"一行多 URL"和"分享长文本里夹 URL"）。
+         * 3. 同一 URL 多次出现只保留一份。
+         */
+        internal fun extractUrls(input: String): List<String> {
+            val seen = LinkedHashSet<String>()
+            for (rawLine in input.lines()) {
+                val line = rawLine.trim()
+                if (line.isEmpty() || line.startsWith("#")) continue
+                for (m in URL_REGEX.findAll(line)) {
+                    var u = m.value
+                    // 去掉尾部中文/英文标点（分享文案经常"… 09/12 teB:/"跟在 URL 后面）
+                    u = u.trimEnd(
+                        '，', '。', ',', '.', ';', '；', ':', '：',
+                        '!', '！', '?', '？', '、', ')', '）', ']', '】',
+                    )
+                    seen.add(u)
+                }
+            }
+            return seen.toList()
+        }
+    }
+
+    fun onBatchItemToggle(id: String) {
+        _uiState.update { state ->
+            val next = state.batchSelectedIds.toMutableSet()
+            if (id in next) next.remove(id) else next.add(id)
+            state.copy(batchSelectedIds = next)
+        }
+    }
+
+    fun onBatchSelectAll() {
+        val items = _uiState.value.batchItems
+        val okIds = items.filter { it.status == BatchItem.Status.OK }.map { it.id }.toSet()
+        _uiState.update { state ->
+            val shouldSelectAll = state.batchSelectedIds.size < okIds.size
+            state.copy(batchSelectedIds = if (shouldSelectAll) okIds else emptySet())
+        }
+    }
+
+    fun onBatchDownloadSelected() {
+        val items = _uiState.value.batchItems
+        val selectedIds = _uiState.value.batchSelectedIds
+        if (selectedIds.isEmpty()) {
+            _uiState.update { it.copy(error = "未选择任何项目") }
+            return
+        }
+        if (!storagePermission.hasPermission()) {
+            // 暂存一个 lambda，权限回来时统一回放
+            pendingBatchDownload = {
+                items.filter { it.id in selectedIds && it.status == BatchItem.Status.OK }
+                    .forEach { item -> submitBatchItem(item) }
+            }
+            storagePermission.request(appContext)
+            return
+        }
+        items.filter { it.id in selectedIds && it.status == BatchItem.Status.OK }
+            .forEach { item -> submitBatchItem(item) }
+    }
+
+    private var pendingBatchDownload: (suspend () -> Unit)? = null
+
+    private fun submitBatchItem(item: BatchItem) {
+        val info = item.contentInfo ?: return
+        when (info) {
+            is ContentInfo.Video -> {
+                val stem = TitleFormatter.formatFilenameStem(info.author, info.title)
+                val filename = "$stem.mp4"
+                val displayName = TitleFormatter.formatDisplayName(info.author, info.title)
+                submit(displayName, "video/mp4") { _, onProgress ->
+                    val url = pickVideoUrl(info) { idx ->
+                        if (idx in info.qualities.indices) idx else 0
+                    }
+                    downloadVideoUseCase(url, filename) { downloaded, total ->
+                        if (total != null) onProgress(downloaded, total)
+                    }
+                }
+            }
+            is ContentInfo.ImageGallery -> {
+                val stem = TitleFormatter.formatFilenameStem(info.author, info.title)
+                val displayName = TitleFormatter.formatDisplayName(info.author, info.title, suffix = "_${info.images.size}张图")
+                submit(displayName, "image/*") { _, onProgress ->
+                    val filenames = info.images.mapIndexed { i, _ -> "${stem}_图${i + 1}.jpg" }
+                    val uris = downloadImagesUseCase.downloadMultiple(info.images, filenames) { c, _ ->
+                        onProgress(c.toLong(), info.images.size.toLong())
+                    }
+                    uris.firstOrNull()
+                }
+            }
+            is ContentInfo.Animated -> {
+                val stem = TitleFormatter.formatFilenameStem(info.author, info.title)
+                val filename = "${stem}_合成.mp4"
+                val displayName = TitleFormatter.formatDisplayName(info.author, info.title, suffix = "_合成")
+                submit(displayName, "video/mp4") { _, _ ->
+                    synthesizeVideoUseCase.fromImages(info.images, info.musicUrl, info.duration, filename)
+                }
+            }
+        }
+    }
+
+    /**
+     * 选画质：复用 settings.defaultQuality 偏好。
+     */
+    private fun pickVideoUrl(info: ContentInfo, defaultIdx: (Int) -> Int): String {
+        val qualities = when (info) {
+            is ContentInfo.Video -> info.qualities
+            is ContentInfo.Animated -> info.qualities
+            else -> return ""
+        }
+        if (qualities.isEmpty()) {
+            return when (info) {
+                is ContentInfo.Video -> info.videoUrl
+                is ContentInfo.Animated -> info.videoUrl
+                else -> ""
+            }
+        }
+        val userIdx = _uiState.value.selectedQualityIndex
+        val preference = settings.value.defaultQuality
+        val idx = when (preference) {
+            SettingsRepository.DefaultQuality.Auto ->
+                if (userIdx in qualities.indices) userIdx else 0
+            SettingsRepository.DefaultQuality.Highest -> qualities.lastIndex
+            SettingsRepository.DefaultQuality.Lowest -> 0
+        }.coerceIn(0, qualities.size - 1)
+        return qualities[idx].url
+    }
+
+    // ---------- 权限 + 调度 ----------
+
+    private fun submit(
+        name: String,
+        mimeType: String?,
+        block: suspend (taskId: Long, onProgress: (Long, Long?) -> Unit) -> Uri?,
+    ) {
+        if (!storagePermission.hasPermission()) {
+            pendingDownload = { downloadManager.enqueue(name, mimeType, block) }
+            // 直接在 ViewModel 里跳系统设置页（@ApplicationContext 已注入）
+            storagePermission.request(appContext)
+            return
+        }
+        downloadManager.enqueue(name, mimeType, block)
+    }
+
+    fun onPermissionResumed() {
+        storagePermission.refresh()
+        val single = pendingDownload
+        val batch = pendingBatchDownload
+        if (!storagePermission.hasPermission()) return
+        if (single != null) {
+            pendingDownload = null
+            viewModelScope.launch { single.invoke() }
+        }
+        if (batch != null) {
+            pendingBatchDownload = null
+            viewModelScope.launch { batch.invoke() }
+        }
+    }
+
+    // ---------- 历史 ----------
 
     fun onHistoryItemClicked(entity: HistoryEntity) {
         val info = when (entity.type) {
@@ -295,15 +623,11 @@ class HomeViewModel @Inject constructor(
         }
     }
 
-    fun onClearDownloadHistory() {
-        viewModelScope.launch {
-            downloadTaskDao.clearAll()
-        }
-    }
-
     fun clearError() {
         _uiState.update { it.copy(error = null) }
     }
+
+    // ---------- 内部工具 ----------
 
     private fun addToHistory(info: ContentInfo) {
         viewModelScope.launch {
@@ -343,8 +667,6 @@ class HomeViewModel @Inject constructor(
         is ContentInfo.Animated -> info.images
         else -> emptyList()
     }
-
-    private fun getContentId(info: ContentInfo?): String = info?.id ?: "unknown"
 
     private fun toJsonArray(list: List<String>): String {
         val arr = JSONArray()

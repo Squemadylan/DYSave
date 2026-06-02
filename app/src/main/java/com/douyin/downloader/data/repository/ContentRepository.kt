@@ -1,6 +1,7 @@
 package com.douyin.downloader.data.repository
 
 import com.douyin.downloader.data.model.ContentInfo
+import com.douyin.downloader.data.model.ParseException
 import com.douyin.downloader.data.remote.AnimatedVideoResolver
 import com.douyin.downloader.data.remote.DouyinApi
 import com.douyin.downloader.data.remote.HtmlParser
@@ -20,9 +21,15 @@ class ContentRepository @Inject constructor(
             url = urlMatch.value
         }
 
-        if ("v.douyin.com" in url) {
-            url = api.resolveShareUrl(url)
+        if (url.isEmpty()) {
+            throw ParseException.InvalidUrl("链接不能为空")
         }
+
+        // 2026 之后：v.douyin.com 短链跳转到 www.douyin.com/aweme-share 新模板页，
+        // 新模板页没有 _ROUTER_DATA（数据靠 JS 异步加载 + a_bogus 签名），
+        // 拿不到。resolveToShareablePage 会尝试从该页抠出 aweme_id，
+        // 再回退到 iesdouyin 旧模板（iOS UA 仍能取到 _ROUTER_DATA）。
+        url = api.resolveToShareablePage(url)
 
         val (type, id) = parser.extractIds(url)
 
@@ -52,10 +59,15 @@ class ContentRepository @Inject constructor(
             var videoUrl = ""
             try {
                 videoUrl = animatedResolver.resolve(noteId)
-            } catch (_: Exception) { }
+            } catch (e: Exception) {
+                throw ParseException.AnimatedVideoResolveFailed("动图视频地址解析失败：${e.message ?: "未知错误"}")
+            }
 
             if (videoUrl.isEmpty()) {
                 videoUrl = parser.findDouyinvodUrl(routerData)
+                if (videoUrl.isEmpty()) {
+                    throw ParseException.AnimatedVideoResolveFailed("未找到动图视频地址，请确认帖子为公开内容")
+                }
             }
 
             return ContentInfo.Animated(
@@ -67,6 +79,7 @@ class ContentRepository @Inject constructor(
                 musicUrl = noteData.musicUrl,
                 duration = noteData.duration,
                 videoUrl = videoUrl,
+                qualities = noteData.qualities,
             )
         }
 

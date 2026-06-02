@@ -14,5 +14,6 @@ data class HistoryEntity(
     val images: String,
     val musicUrl: String,
     val duration: Int,
+    val uri: String? = null,
     val timestamp: Long = System.currentTimeMillis(),
 )

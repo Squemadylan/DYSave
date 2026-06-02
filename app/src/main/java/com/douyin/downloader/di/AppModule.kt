@@ -5,6 +5,7 @@ import androidx.room.Room
 import com.douyin.downloader.data.local.AppDatabase
 import com.douyin.downloader.data.local.DownloadTaskDao
 import com.douyin.downloader.data.local.HistoryDao
+import com.douyin.downloader.data.local.SessionManager
 import dagger.Module
 import dagger.Provides
 import dagger.hilt.InstallIn
@@ -31,7 +32,9 @@ object AppModule {
     @Singleton
     fun provideDatabase(@ApplicationContext context: Context): AppDatabase =
         Room.databaseBuilder(context, AppDatabase::class.java, "dy_history")
-            .addMigrations(AppDatabase.MIGRATION_1_2)
+            .addMigrations(*AppDatabase.ALL_MIGRATIONS)
+            // 任何未知旧版本都丢表重建——宁可丢历史也不闪退。
+            .fallbackToDestructiveMigration()
             .build()
 
     @Provides
@@ -39,4 +42,9 @@ object AppModule {
 
     @Provides
     fun provideDownloadTaskDao(db: AppDatabase): DownloadTaskDao = db.downloadTaskDao()
+
+    @Provides
+    @Singleton
+    fun provideSessionManager(@ApplicationContext context: Context): SessionManager =
+        SessionManager(context)
 }

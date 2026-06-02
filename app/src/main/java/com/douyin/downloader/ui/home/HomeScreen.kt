@@ -23,9 +23,11 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.itemsIndexed
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -39,6 +41,8 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExtendedFloatingActionButton
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -62,6 +66,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import com.douyin.downloader.data.model.ContentInfo
+import com.douyin.downloader.data.model.VideoQuality
 
 @Composable
 fun HomeScreen(
@@ -113,7 +118,7 @@ fun HomeScreen(
             ) {
                 // Title
                 Text(
-                    text = "轻载",
+                    text = "圆圆解析",
                     style = MaterialTheme.typography.headlineMedium,
                 )
                 Spacer(modifier = Modifier.height(20.dp))
@@ -170,8 +175,10 @@ fun HomeScreen(
                         ResultContent(
                             info = state.contentInfo!!,
                             selectedImages = state.selectedImages,
+                            selectedQualityIndex = state.selectedQualityIndex,
                             onImageToggled = viewModel::onImageToggled,
                             onSelectAll = viewModel::onSelectAll,
+                            onQualitySelected = viewModel::onQualitySelected,
                             onDownloadVideo = {
                                 viewModel.onDownloadVideo()
                                 onNavigateToDownloads()
@@ -244,8 +251,10 @@ private fun LoadingState() {
 private fun ResultContent(
     info: ContentInfo,
     selectedImages: Set<Int>,
+    selectedQualityIndex: Int,
     onImageToggled: (Int) -> Unit,
     onSelectAll: () -> Unit,
+    onQualitySelected: (Int) -> Unit,
     onDownloadVideo: () -> Unit,
     onDownloadCurrentImage: () -> Unit,
     onSynthesizeVideo: () -> Unit,
@@ -253,7 +262,12 @@ private fun ResultContent(
 ) {
     when (info) {
         is ContentInfo.Video -> {
-            VideoResult(info, onDownloadVideo)
+            VideoResult(
+                info = info,
+                selectedQualityIndex = selectedQualityIndex,
+                onQualitySelected = onQualitySelected,
+                onDownload = onDownloadVideo,
+            )
         }
         is ContentInfo.ImageGallery -> {
             ImageGridResult(
@@ -267,7 +281,12 @@ private fun ResultContent(
         }
         is ContentInfo.Animated -> {
             if (info.videoUrl.isNotEmpty()) {
-                AnimatedVideoResult(info, onMergeAnimatedVideo)
+                AnimatedVideoResult(
+                    info = info,
+                    selectedQualityIndex = selectedQualityIndex,
+                    onQualitySelected = onQualitySelected,
+                    onDownload = onMergeAnimatedVideo,
+                )
             } else {
                 ImageGridResult(
                     info = info,
@@ -283,7 +302,12 @@ private fun ResultContent(
 }
 
 @Composable
-private fun VideoResult(info: ContentInfo.Video, onDownload: () -> Unit) {
+private fun VideoResult(
+    info: ContentInfo.Video,
+    selectedQualityIndex: Int,
+    onQualitySelected: (Int) -> Unit,
+    onDownload: () -> Unit,
+) {
     Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
         CoverImage(cover = info.cover, modifier = Modifier.fillMaxWidth())
         Spacer(modifier = Modifier.height(12.dp))
@@ -300,6 +324,14 @@ private fun VideoResult(info: ContentInfo.Video, onDownload: () -> Unit) {
             maxLines = 2,
             overflow = TextOverflow.Ellipsis,
         )
+        if (info.qualities.isNotEmpty()) {
+            Spacer(modifier = Modifier.height(12.dp))
+            QualityChips(
+                qualities = info.qualities,
+                selectedIndex = selectedQualityIndex,
+                onSelected = onQualitySelected,
+            )
+        }
         Spacer(modifier = Modifier.height(12.dp))
         Button(onClick = onDownload, modifier = Modifier.fillMaxWidth()) {
             Text("下载视频")
@@ -308,7 +340,12 @@ private fun VideoResult(info: ContentInfo.Video, onDownload: () -> Unit) {
 }
 
 @Composable
-private fun AnimatedVideoResult(info: ContentInfo.Animated, onDownload: () -> Unit) {
+private fun AnimatedVideoResult(
+    info: ContentInfo.Animated,
+    selectedQualityIndex: Int,
+    onQualitySelected: (Int) -> Unit,
+    onDownload: () -> Unit,
+) {
     Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
         CoverImage(cover = info.cover, modifier = Modifier.fillMaxWidth())
         Spacer(modifier = Modifier.height(12.dp))
@@ -325,9 +362,54 @@ private fun AnimatedVideoResult(info: ContentInfo.Animated, onDownload: () -> Un
             maxLines = 2,
             overflow = TextOverflow.Ellipsis,
         )
+        if (info.qualities.isNotEmpty()) {
+            Spacer(modifier = Modifier.height(12.dp))
+            QualityChips(
+                qualities = info.qualities,
+                selectedIndex = selectedQualityIndex,
+                onSelected = onQualitySelected,
+            )
+        }
         Spacer(modifier = Modifier.height(12.dp))
         Button(onClick = onDownload, modifier = Modifier.fillMaxWidth()) {
             Text("下载视频（含音乐）")
+        }
+    }
+}
+
+@Composable
+private fun QualityChips(
+    qualities: List<VideoQuality>,
+    selectedIndex: Int,
+    onSelected: (Int) -> Unit,
+) {
+    Column {
+        Text(
+            text = "清晰度",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(modifier = Modifier.height(6.dp))
+        LazyRow(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            items(qualities) { quality ->
+                val index = qualities.indexOf(quality)
+                FilterChip(
+                    selected = index == selectedIndex,
+                    onClick = { onSelected(index) },
+                    label = {
+                        Text(
+                            text = quality.label + if (quality.isH265) " (H.265)" else "",
+                            style = MaterialTheme.typography.labelMedium,
+                        )
+                    },
+                    colors = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = MaterialTheme.colorScheme.primaryContainer,
+                        selectedLabelColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                    ),
+                )
+            }
         }
     }
 }

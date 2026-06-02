@@ -5,7 +5,7 @@ import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
-@Database(entities = [HistoryEntity::class, DownloadTaskEntity::class], version = 2, exportSchema = false)
+@Database(entities = [HistoryEntity::class, DownloadTaskEntity::class], version = 3, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun historyDao(): HistoryDao
     abstract fun downloadTaskDao(): DownloadTaskDao
@@ -24,5 +24,18 @@ abstract class AppDatabase : RoomDatabase() {
                 )
             }
         }
+
+        // 2 -> 3: add uri / mimeType columns to download_tasks.
+        // Fixes "schema hash mismatch" crashes on devices that already
+        // had the v2 database (newer entity had these fields but version
+        // was never bumped).
+        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `download_tasks` ADD COLUMN `uri` TEXT")
+                db.execSQL("ALTER TABLE `download_tasks` ADD COLUMN `mimeType` TEXT")
+            }
+        }
+
+        val ALL_MIGRATIONS: Array<Migration> = arrayOf(MIGRATION_1_2, MIGRATION_2_3)
     }
 }

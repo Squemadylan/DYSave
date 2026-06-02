@@ -11,7 +11,6 @@ import com.douyin.downloader.data.remote.DouyinApi
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import java.io.ByteArrayInputStream
 import java.io.File
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
@@ -23,38 +22,66 @@ class DownloadRepository @Inject constructor(
     @ApplicationContext private val context: Context,
     private val api: DouyinApi,
 ) {
-    suspend fun saveVideo(bytes: ByteArray, filename: String): Uri =
-        saveToMediaStore(bytes, filename, "video/mp4", MediaStore.Downloads.EXTERNAL_CONTENT_URI)
+    companion object {
+        /**
+         * 公开下载目录的相对路径。需要宿主在调用本仓库前确保已获得
+         * MANAGE_EXTERNAL_STORAGE 权限（Android 11+）或 WRITE_EXTERNAL_STORAGE
+         * 权限（Android 10 及以下）。
+         *
+         * Downloads/DYSave/ 目录无需手动创建 —— 通过 MediaStore.insert 时
+         * 设置 RELATIVE_PATH，Android 10+ 会自动创建；Android 9 及以下我们用
+         * Environment.getExternalStoragePublicDirectory() 显式创建。
+         */
+        val SUBDIR: String = Environment.DIRECTORY_DOWNLOADS + "/DYSave"
+    }
+
+    // ---------------------------------------------------------------------
+    // 公共保存入口
+    // ---------------------------------------------------------------------
+
+    suspend fun saveVideo(bytes: ByteArray, filename: String): Uri = withContext(Dispatchers.IO) {
+        val uri = createPendingItem(filename, "video/mp4")
+        writeAll(uri, bytes)
+        finalize(uri)
+        uri
+    }
 
     suspend fun saveVideoStream(
         videoUrl: String,
         filename: String,
         onProgress: (Long, Long?) -> Unit = { _, _ -> },
     ): Uri = withContext(Dispatchers.IO) {
-        val uri = createMediaStoreUri(filename, "video/mp4", MediaStore.Downloads.EXTERNAL_CONTENT_URI)
+        val uri = createPendingItem(filename, "video/mp4")
         context.contentResolver.openOutputStream(uri)?.use { output ->
             api.streamTo(videoUrl, output, onProgress)
-        } ?: throw Exception("无法写入文件")
-        finalizeMediaStoreUri(uri)
+        } ?: throw IllegalStateException("无法打开输出流：$uri")
+        finalize(uri)
         uri
     }
 
-    suspend fun saveImage(bytes: ByteArray, filename: String): Uri =
-        saveToMediaStore(bytes, filename, "image/*", MediaStore.Images.Media.EXTERNAL_CONTENT_URI)
+    suspend fun saveImage(bytes: ByteArray, filename: String): Uri = withContext(Dispatchers.IO) {
+        val uri = createPendingItem(filename, "image/*")
+        writeAll(uri, bytes)
+        finalize(uri)
+        uri
+    }
 
     suspend fun saveImagesZip(imageUrls: List<String>, filename: String): Uri =
         withContext(Dispatchers.IO) {
-            val buf = java.io.ByteArrayOutputStream()
-            ZipOutputStream(buf).use { zos ->
-                imageUrls.forEachIndexed { i, url ->
-                    val bytes = api.downloadBytes(url)
-                    val ext = inferImageExt(url)
-                    zos.putNextEntry(ZipEntry("image_${i + 1}$ext"))
-                    zos.write(bytes)
-                    zos.closeEntry()
+            val uri = createPendingItem(filename, "application/zip")
+            context.contentResolver.openOutputStream(uri)?.use { out ->
+                ZipOutputStream(out).use { zos ->
+                    imageUrls.forEachIndexed { i, url ->
+                        val bytes = api.downloadBytes(url)
+                        val ext = inferImageExt(url)
+                        zos.putNextEntry(ZipEntry("image_${i + 1}$ext"))
+                        zos.write(bytes)
+                        zos.closeEntry()
+                    }
                 }
-            }
-            saveToMediaStore(buf.toByteArray(), filename, "application/zip", MediaStore.Downloads.EXTERNAL_CONTENT_URI)
+            } ?: throw IllegalStateException("无法打开输出流：$uri")
+            finalize(uri)
+            uri
         }
 
     suspend fun synthesizeVideo(
@@ -92,11 +119,14 @@ class DownloadRepository @Inject constructor(
 
             val session = FFmpegKit.execute(command)
             if (session.returnCode.isValueError) {
-                throw Exception("ffmpeg 失败: ${session.output.takeLast(500)}")
+                throw IllegalStateException("ffmpeg 失败: ${session.output.takeLast(500)}")
             }
 
             val bytes = outputFile.readBytes()
-            saveToMediaStore(bytes, filename, "video/mp4", MediaStore.Downloads.EXTERNAL_CONTENT_URI)
+            val uri = createPendingItem(filename, "video/mp4")
+            writeAll(uri, bytes)
+            finalize(uri)
+            uri
         } finally {
             tmpDir.deleteRecursively()
         }
@@ -109,7 +139,10 @@ class DownloadRepository @Inject constructor(
     ): Uri = withContext(Dispatchers.IO) {
         if (musicUrl.isNullOrEmpty()) {
             val bytes = api.downloadBytes(videoUrl, timeoutSeconds = 60)
-            return@withContext saveToMediaStore(bytes, filename, "video/mp4", MediaStore.Downloads.EXTERNAL_CONTENT_URI)
+            val uri = createPendingItem(filename, "video/mp4")
+            writeAll(uri, bytes)
+            finalize(uri)
+            return@withContext uri
         }
 
         val tmpDir = File(context.cacheDir, "dy_merge_${System.currentTimeMillis()}")
@@ -129,15 +162,70 @@ class DownloadRepository @Inject constructor(
 
             val session = FFmpegKit.execute(command)
             if (session.returnCode.isValueError) {
-                throw Exception("ffmpeg 合并失败: ${session.output.takeLast(500)}")
+                throw IllegalStateException("ffmpeg 合并失败: ${session.output.takeLast(500)}")
             }
 
             val bytes = outputFile.readBytes()
-            saveToMediaStore(bytes, filename, "video/mp4", MediaStore.Downloads.EXTERNAL_CONTENT_URI)
+            val uri = createPendingItem(filename, "video/mp4")
+            writeAll(uri, bytes)
+            finalize(uri)
+            uri
         } finally {
             tmpDir.deleteRecursively()
         }
     }
+
+    // ---------------------------------------------------------------------
+    // MediaStore 私有工具
+    // ---------------------------------------------------------------------
+
+    private fun createPendingItem(filename: String, mimeType: String): Uri {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            // Android 9 及以下：直接走文件系统，调用方需 WRITE_EXTERNAL_STORAGE
+            ensureLegacyDir()
+        }
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
+            put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                put(MediaStore.MediaColumns.RELATIVE_PATH, SUBDIR)
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            }
+        }
+        return context.contentResolver.insert(
+            MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+            values,
+        ) ?: throw IllegalStateException(
+            "无法创建 MediaStore 条目：可能缺少存储权限或文件名冲突（$filename）"
+        )
+    }
+
+    private fun writeAll(uri: Uri, bytes: ByteArray) {
+        context.contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+            ?: throw IllegalStateException("无法写入：$uri")
+    }
+
+    private fun finalize(uri: Uri) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.IS_PENDING, 0)
+            }
+            context.contentResolver.update(uri, values, null, null)
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun ensureLegacyDir() {
+        val legacy = File(
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+            "DYSave",
+        )
+        if (!legacy.exists()) legacy.mkdirs()
+    }
+
+    // ---------------------------------------------------------------------
+    // FFmpeg 命令构造
+    // ---------------------------------------------------------------------
 
     private fun buildSingleImageCommand(
         imgPath: String,
@@ -176,40 +264,6 @@ class DownloadRepository @Inject constructor(
         sb.append("-c:v libopenh264 -pix_fmt yuv420p -c:a aac -b:a 192k ")
         sb.append("-t $duration -shortest $outputPath")
         return sb.toString()
-    }
-
-    private fun saveToMediaStore(
-        bytes: ByteArray,
-        filename: String,
-        mimeType: String,
-        collection: Uri,
-    ): Uri {
-        val uri = createMediaStoreUri(filename, mimeType, collection)
-        context.contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
-            ?: throw Exception("无法写入文件")
-        finalizeMediaStoreUri(uri)
-        return uri
-    }
-
-    private fun createMediaStoreUri(filename: String, mimeType: String, collection: Uri): Uri {
-        val contentValues = ContentValues().apply {
-            put(MediaStore.Downloads.DISPLAY_NAME, filename)
-            put(MediaStore.Downloads.MIME_TYPE, mimeType)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(MediaStore.Downloads.IS_PENDING, 1)
-            }
-        }
-        return context.contentResolver.insert(collection, contentValues)
-            ?: throw Exception("无法创建 MediaStore 条目")
-    }
-
-    private fun finalizeMediaStoreUri(uri: Uri) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val contentValues = ContentValues().apply {
-                put(MediaStore.Downloads.IS_PENDING, 0)
-            }
-            context.contentResolver.update(uri, contentValues, null, null)
-        }
     }
 
     private fun inferImageExt(url: String): String {
