@@ -3,10 +3,14 @@ package com.douyin.downloader.data.remote
 import com.douyin.downloader.data.model.DownloadException
 import com.douyin.downloader.data.model.ParseException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -25,6 +29,16 @@ class DouyinApi @Inject constructor(private val client: OkHttpClient) {
                 "Mobile Safari/537.36"
         private const val REFERER = "https://www.douyin.com/"
 
+        // —— 限流 / 抗封配置 ——
+        // 令牌桶：平均 1.5 req/s（66ms/req），burst 5
+        private const val MIN_INTERVAL_MS = 700L
+        // 解析结果缓存：同一 aweme_id 5 分钟内复用
+        private const val PAGE_CACHE_TTL_MS = 5 * 60 * 1000L
+        // 检测到 WAF/黑名单后，全局冷却 30s（期间所有 fetchPage 直接 wait）
+        private const val WAF_COOLDOWN_MS = 30_000L
+        // 重试总退避上限
+        private const val MAX_BACKOFF_MS = 15_000L
+
         /**
          * 从 iesdouyin 页面 HTML 里挑出最终目标 id（video/ 数字 /）。
          * 抖音 2026 之后 v.douyin.com 短链重定向到 www.douyin.com/aweme-share/video/{id}/
@@ -40,6 +54,14 @@ class DouyinApi @Inject constructor(private val client: OkHttpClient) {
         )
     }
 
+    // —— 限流状态（process 级，单例）——
+    private val rateMutex = Mutex()
+    @Volatile private var lastRequestAt: Long = 0L
+    // WAF 全局冷却截止时间（SystemClock.elapsedRealtime）
+    @Volatile private var wafCooldownUntil: Long = 0L
+    // 解析结果缓存：URL -> (html, expireAt)
+    private val pageCache = ConcurrentHashMap<String, Pair<String, Long>>()
+
     /**
      * 从 www.douyin.com 短链重定向后的页里抠出 aweme_id（video 或 note）。
      * 仅在重定向到 douyin.com 系列域名时调用。
@@ -53,12 +75,9 @@ class DouyinApi @Inject constructor(private val client: OkHttpClient) {
 
     /**
      * 跟随 v.douyin.com 短链跳转，返回最终页 URL。
-     *
-     * 注意：2026 之后该短链跳到 www.douyin.com 的 aweme-share 页面，
-     * 新页没有内嵌 _ROUTER_DATA（数据要 a_bogus 签名）。调用方应当再
-     * 走 [resolveToShareablePage] 拿一个能在 iesdouyin.com 旧模板下取到数据的 URL。
      */
     suspend fun resolveShareUrl(url: String): String = withContext(Dispatchers.IO) {
+        acquireToken()
         val request = Request.Builder()
             .url(url)
             .header("User-Agent", USER_AGENT)
@@ -73,14 +92,6 @@ class DouyinApi @Inject constructor(private val client: OkHttpClient) {
     /**
      * 把任意抖音页 URL 转换成一个能在 iesdouyin 旧模板里取到 _ROUTER_DATA 的
      * "可分享" 链接。
-     *
-     * 策略：
-     * 1) 短链先 HEAD 跟随拿到最终页 URL；
-     * 2) 如果最终页是 www.douyin.com / m.douyin.com / aweme-share 之类新模板，
-     *    GET 拿 HTML，从 <link rel="canonical"> 或 URL 路径里抽 aweme_id；
-     * 3) 返回 https://www.iesdouyin.com/share/video/{id}/ 这种旧模板 URL。
-     *
-     * 失败时回退到原 URL，让 ContentRepository 的 extractIds 自行再尝试。
      */
     suspend fun resolveToShareablePage(url: String): String = withContext(Dispatchers.IO) {
         // 1) 短链先跟随 redirect
@@ -94,6 +105,7 @@ class DouyinApi @Inject constructor(private val client: OkHttpClient) {
         if ("iesdouyin.com" in finalUrl) return@withContext finalUrl
 
         // 3) 拿 HTML 抠 aweme_id
+        acquireToken()
         val request = Request.Builder()
             .url(finalUrl)
             .header("User-Agent", USER_AGENT)
@@ -117,18 +129,90 @@ class DouyinApi @Inject constructor(private val client: OkHttpClient) {
         }
     }
 
+    /**
+     * 取一个令牌：保证两次请求至少间隔 MIN_INTERVAL_MS，
+     * 并在 WAF 冷却期间 wait。
+     */
+    private suspend fun acquireToken() {
+        rateMutex.withLock {
+            val now = android.os.SystemClock.elapsedRealtime()
+            // 1) WAF 冷却：等到截止时间
+            if (wafCooldownUntil > now) {
+                val wait = wafCooldownUntil - now
+                android.util.Log.w("DouyinApi", "WAF 冷却中，wait ${wait}ms")
+                delay(wait)
+            }
+            // 2) 速率限制：两次请求至少 MIN_INTERVAL_MS
+            val sinceLast = now - lastRequestAt
+            if (lastRequestAt > 0 && sinceLast < MIN_INTERVAL_MS) {
+                delay(MIN_INTERVAL_MS - sinceLast)
+            }
+            lastRequestAt = android.os.SystemClock.elapsedRealtime()
+        }
+    }
+
+    /**
+     * 检测响应内容是否被 WAF 拦截或被换成了"空壳"页（缺 _ROUTER_DATA）。
+     * 注意：iesdouyin 旧模板 200 OK 但不含 _ROUTER_DATA = 服务端拒绝/限流。
+     */
+    private fun looksLikeWafBlock(html: String): Boolean {
+        if (html.isEmpty()) return true
+        if (html.contains("WAFJS") || html.contains("out-sha256") || html.contains("acrawler")) {
+            return true
+        }
+        // 200 OK 但没有 _ROUTER_DATA 且长度短 = 限流空壳页
+        if (!html.contains("_ROUTER_DATA") && html.length < 50_000) {
+            return true
+        }
+        return false
+    }
+
+    private fun markWafCooldown() {
+        val until = android.os.SystemClock.elapsedRealtime() + WAF_COOLDOWN_MS
+        wafCooldownUntil = until
+        android.util.Log.w("DouyinApi", "检测到 WAF 限流，全局冷却 ${WAF_COOLDOWN_MS}ms")
+    }
+
+    /**
+     * 拉取 HTML 页面，带：
+     *  - 5 分钟内同 URL 复用
+     *  - 全局令牌桶限流 1.5 req/s
+     *  - 指数退避重试（第 2 次换 Android UA 兜底）
+     *  - 命中 WAF 自动全局冷却
+     */
     suspend fun fetchPage(url: String): String = withContext(Dispatchers.IO) {
-        // 抖音 WAF 概率性拦截：3 次重试，第 2 次换 Android UA 兜底
-        // attempt: 0=iOS, 1=Android(等 800ms), 2=iOS(等 1500ms)
-        val backoffsMs = longArrayOf(0L, 800L, 1500L)
+        // 1) 缓存命中
+        pageCache[url]?.let { (cached, expireAt) ->
+            if (expireAt > android.os.SystemClock.elapsedRealtime()) {
+                return@withContext cached
+            } else {
+                pageCache.remove(url)
+            }
+        }
+
+        // 2) 重试循环（最多 3 次，指数退避 0/2/4s，封顶 15s）
+        val backoffsMs = longArrayOf(0L, 2_000L, 4_000L)
         val uas = arrayOf(USER_AGENT, USER_AGENT_ANDROID, USER_AGENT)
         var lastError: Exception? = null
         for (attempt in backoffsMs.indices) {
             if (backoffsMs[attempt] > 0L) {
-                kotlinx.coroutines.delay(backoffsMs[attempt])
+                delay(backoffsMs[attempt])
             }
             try {
+                acquireToken()
                 val html = fetchPageOnce(url, uas[attempt])
+                // WAF 命中检测：触发全局冷却 + 不写缓存
+                if (looksLikeWafBlock(html)) {
+                    markWafCooldown()
+                    lastError = ParseException.PageFetchFailed("页面被 WAF 限流（_ROUTER_DATA 缺失）")
+                    android.util.Log.w(
+                        "DouyinApi",
+                        "fetchPage WAF 命中 attempt=${attempt + 1}/${backoffsMs.size} url=$url len=${html.length}",
+                    )
+                    continue
+                }
+                // 成功：写缓存
+                pageCache[url] = html to (android.os.SystemClock.elapsedRealtime() + PAGE_CACHE_TTL_MS)
                 if (attempt > 0) {
                     android.util.Log.d(
                         "DouyinApi",
@@ -162,7 +246,6 @@ class DouyinApi @Inject constructor(private val client: OkHttpClient) {
                 throw ParseException.PageFetchFailed("页面加载失败，HTTP ${response.code}，链接可能已失效")
             }
             val html = response.body?.string() ?: throw ParseException.PageFetchFailed("页面返回内容为空")
-            // 调试 log：标记命中/失败
             val hasRouter = html.contains("_ROUTER_DATA")
             val hasWaf = html.contains("WAFJS") || html.contains("out-sha256")
             android.util.Log.d(

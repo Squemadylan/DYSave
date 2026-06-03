@@ -355,7 +355,10 @@ class HomeViewModel @Inject constructor(
 
         viewModelScope.launch {
             val results = coroutineScope {
-                val semaphore = Semaphore(permits = 3)
+                // 并发从 3 降到 2，配合 DouyinApi 令牌桶（700ms/req），
+                // 实际峰值 ~3 req/s（1.4 双并发 + 1 个 download 反向心跳），
+                // 避免触发抖音 WAF 频率封禁。
+                val semaphore = Semaphore(permits = 2)
                 val done = java.util.concurrent.atomic.AtomicInteger(0)
                 urls.mapIndexed { index, url ->
                     async {
