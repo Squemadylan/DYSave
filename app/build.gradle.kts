@@ -80,8 +80,12 @@ dependencies {
     // OkHttp
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
+    // Haze blur for TopAppBar / BottomSheet / Player
+    implementation("dev.chrisbanes.haze:haze:1.5.0")
+
     // Coil
     implementation("io.coil-kt:coil-compose:2.7.0")
+    implementation("androidx.compose.material:material-icons-extended")
 
     // ExoPlayer (Media3)
     implementation("androidx.media3:media3-exoplayer:1.6.0")

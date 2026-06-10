@@ -4,10 +4,13 @@ import android.net.Uri
 import com.douyin.downloader.data.local.DownloadTaskDao
 import com.douyin.downloader.data.local.DownloadTaskEntity
 import com.douyin.downloader.data.local.SettingsRepository
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -18,35 +21,24 @@ import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.sync.Mutex
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import javax.inject.Inject
 import javax.inject.Singleton
 
-/**
- * 全局下载编排器。
- *
- * 职责：
- * - 持有全局并发信号量（默认 2 路同时下载）
- * - 暴露活动任务状态（StateFlow<Set<DownloadTask>>）
- * - 暴露最近一次结果/错误（SharedFlow<DownloadEvent>，供一次性 toast / 通知使用）
- * - 把完成的任务写入 [DownloadTaskDao] 历史表
- *
- * 任何 ViewModel（HomeViewModel、BatchDownloadViewModel、未来的 ProfileViewModel）
- * 都可以通过 `enqueue(...)` 把下载意图投递进来，由本类统一调度。
- *
- * 并发数同步：启动时从 [SettingsRepository] 读一次 DataStore 中的值；之后
- * SettingsRepository 的 flow 一旦变化（含 ProfileViewModel 写入），就立刻重建 Semaphore。
- * 这样无论应用冷启动 / 热启动，maxConcurrent 始终与持久化设置一致。
- */
 @Singleton
 class DownloadManager @Inject constructor(
     private val downloadTaskDao: DownloadTaskDao,
     settingsRepository: SettingsRepository,
 ) {
-    enum class Status { PENDING, DOWNLOADING, DONE, ERROR }
+    enum class Status {
+        PENDING,
+        RUNNING,
+        PAUSED,
+        DONE,
+        ERROR,
+    }
 
     data class Task(
         val id: Long,
@@ -75,103 +67,251 @@ class DownloadManager @Inject constructor(
     )
     val events: SharedFlow<Event> = _events.asSharedFlow()
 
-    // 全局并发控制：同时最多 N 路下载。
-    // 跨 ViewModel 共享 —— AppModule 也可注入同一实例。
-    // 调整并发数时会原子替换；正在跑的任务继续持有旧 semaphore 引用，自然完成。
-    private val semaphoreRef = AtomicReference(Semaphore(permits = 2))
+    private val maxConcurrentRef = AtomicLong(2)
 
-    /** 当前生效的 Semaphore，新任务会取最新值。 */
-    val currentSemaphore: Semaphore get() = semaphoreRef.get()
+    private val pendingQueue = ArrayDeque<Long>()
 
-    /** 重新设置并发数。返回是否真的发生了变化。 */
-    fun setMaxConcurrent(permits: Int): Boolean {
-        val p = permits.coerceIn(1, 6)
-        val old = semaphoreRef.get()
-        if (old.availablePermits == p) return false
-        semaphoreRef.set(Semaphore(permits = p))
-        return true
-    }
+    private val taskJobs = AtomicReference<Map<Long, Job>>(emptyMap())
+
+    private val taskPauseFlags = AtomicReference<Map<Long, Boolean>>(emptyMap())
+
+    private val taskBlocks = AtomicReference<Map<Long, suspend (Long, (Long, Long?) -> Unit, () -> Boolean) -> Uri?>>(emptyMap())
+
+    private val taskMutex = Mutex()
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     init {
-        // 1) 启动时立刻从 DataStore 同步一次当前并发数（解决"重启后回到默认 2"的 bug）
         scope.launch {
             val initial = settingsRepository.flow.first()
-            setMaxConcurrent(initial.maxConcurrent)
+            maxConcurrentRef.set(initial.maxConcurrent.coerceIn(1, 6).toLong())
         }
-        // 2) 持续监听 DataStore 变化（覆盖 ProfileViewModel 写入等路径），重建 Semaphore
         scope.launch {
             settingsRepository.flow.drop(1).collect { settings ->
-                setMaxConcurrent(settings.maxConcurrent)
+                val newMax = settings.maxConcurrent.coerceIn(1, 6)
+                adjustConcurrency(newMax)
             }
+        }
+    }
+
+    fun setMaxConcurrent(permits: Int) {
+        val newMax = permits.coerceIn(1, 6)
+        adjustConcurrency(newMax)
+    }
+
+    private fun adjustConcurrency(newMax: Int) {
+        val oldMax = maxConcurrentRef.getAndSet(newMax.toLong()).toInt()
+        if (oldMax == newMax) return
+
+        scope.launch {
+            taskMutex.lock()
+            try {
+                if (newMax > oldMax) {
+                    val runningCount = _activeTasks.value.values.count { it.status == Status.RUNNING }
+                    val toStart = minOf(newMax - runningCount, pendingQueue.size)
+                    repeat(toStart) {
+                        val taskId = pendingQueue.removeFirstOrNull() ?: return@repeat
+                        startTask(taskId)
+                    }
+                } else {
+                    val toPause = oldMax - newMax
+                    pauseRunningTasks(toPause)
+                }
+            } finally {
+                taskMutex.unlock()
+            }
+        }
+    }
+
+    private suspend fun pauseRunningTasks(count: Int) {
+        var remaining = count
+        val runningTasks = _activeTasks.value.filter { it.value.status == Status.RUNNING }
+        for ((taskId, _) in runningTasks) {
+            if (remaining <= 0) break
+            val currentFlags = taskPauseFlags.get().toMutableMap()
+            currentFlags[taskId] = true
+            taskPauseFlags.set(currentFlags)
+            updateTaskState(taskId, Status.PAUSED)
+            remaining--
+        }
+    }
+
+    private fun updateTaskState(taskId: Long, status: Status) {
+        _activeTasks.update { current ->
+            val existing = current[taskId] ?: return@update current
+            current + (taskId to existing.copy(status = status))
         }
     }
 
     fun enqueue(
         name: String,
         mimeType: String?,
-        block: suspend (taskId: Long, onProgress: (Long, Long?) -> Unit) -> Uri?,
+        block: suspend (taskId: Long, onProgress: (Long, Long?) -> Unit, isPaused: () -> Boolean) -> Uri?,
     ) {
         val id = taskIdCounter.incrementAndGet()
         val initial = Task(id = id, name = name, mimeType = mimeType, status = Status.PENDING)
         _activeTasks.update { it + (id to initial) }
 
-        // 取出本任务要用的 semaphore 引用；之后即使 setMaxConcurrent 替换了
-        // 全局引用，本任务继续走旧 semaphore，自然完成不会被打断。
-        val sem = currentSemaphore
+        taskPauseFlags.set(taskPauseFlags.get() + (id to false))
+        taskBlocks.set(taskBlocks.get() + (id to block))
+
         scope.launch {
-            sem.withPermit {
-                update(id) { it.copy(status = Status.DOWNLOADING) }
-                try {
-                    val onProgress: (Long, Long?) -> Unit = { downloaded, total ->
-                        if (total != null && total > 0) {
-                            update(id) { it.copy(progress = downloaded.toFloat() / total) }
-                        }
-                    }
-                    val uri = block(id, onProgress)
-                    val done = _activeTasks.value[id]?.copy(
-                        status = Status.DONE,
-                        progress = 1f,
-                        uri = uri?.toString(),
-                    ) ?: return@withPermit
-                    // 写历史
-                    downloadTaskDao.insert(
-                        DownloadTaskEntity(
-                            name = name,
-                            status = "DONE",
-                            uri = uri?.toString(),
-                            mimeType = mimeType,
-                        ),
-                    )
-                    // 从活动列表移除
-                    _activeTasks.update { it - id }
-                    _events.tryEmit(Event.Completed(done))
-                } catch (e: Exception) {
-                    val msg = e.message ?: "下载失败，请检查网络或存储空间"
-                    val failed = _activeTasks.value[id]?.copy(
-                        status = Status.ERROR,
-                        error = msg,
-                    ) ?: return@withPermit
-                    downloadTaskDao.insert(
-                        DownloadTaskEntity(
-                            name = name,
-                            status = "ERROR",
-                            error = msg,
-                            mimeType = mimeType,
-                        ),
-                    )
-                    _activeTasks.update { it - id }
-                    _events.tryEmit(Event.Failed(failed, msg))
+            taskMutex.lock()
+            try {
+                val currentMax = maxConcurrentRef.get().toInt()
+                val runningCount = _activeTasks.value.values.count { it.status == Status.RUNNING }
+
+                if (runningCount < currentMax) {
+                    startTask(id)
+                } else {
+                    pendingQueue.addLast(id)
                 }
+            } finally {
+                taskMutex.unlock()
             }
         }
     }
 
-    private fun update(id: Long, transform: (Task) -> Task) {
-        _activeTasks.update { current ->
-            val existing = current[id] ?: return@update current
-            current + (id to transform(existing))
+    private fun startTask(taskId: Long) {
+        pendingQueue.remove(taskId)
+
+        val job = scope.launch {
+            executeTask(taskId)
+        }
+
+        val jobs = taskJobs.get().toMutableMap()
+        jobs[taskId] = job
+        taskJobs.set(jobs)
+
+        updateTaskState(taskId, Status.RUNNING)
+    }
+
+    private suspend fun executeTask(taskId: Long) {
+        val task = _activeTasks.value[taskId] ?: return
+        val name = task.name
+        val mimeType = task.mimeType
+        val block = taskBlocks.get()[taskId] ?: return
+
+        val onProgress: (Long, Long?) -> Unit = { downloaded, total ->
+            if (total != null && total > 0) {
+                val paused = taskPauseFlags.get()[taskId] == true
+                if (!paused) {
+                    _activeTasks.update { current ->
+                        val existing = current[taskId] ?: return@update current
+                        current + (taskId to existing.copy(progress = downloaded.toFloat() / total))
+                    }
+                }
+            }
+        }
+
+        val isPaused: () -> Boolean = { taskPauseFlags.get()[taskId] == true }
+
+        while (isPaused()) {
+            delay(100)
+            val done = _activeTasks.value[taskId]
+            if (done == null || done.status != Status.PAUSED) return
+        }
+
+        try {
+            val uri = block(taskId, onProgress, isPaused)
+
+            val done = _activeTasks.value[taskId]?.copy(
+                status = Status.DONE,
+                progress = 1f,
+                uri = uri?.toString(),
+            )
+            if (done != null) {
+                downloadTaskDao.insert(
+                    DownloadTaskEntity(
+                        name = name,
+                        status = "DONE",
+                        uri = uri?.toString(),
+                        mimeType = mimeType,
+                    ),
+                )
+                _activeTasks.update { it - taskId }
+                _events.tryEmit(Event.Completed(done))
+            }
+
+        } catch (e: Exception) {
+            if (e is CancellationException) {
+                handleTaskCancelled(taskId, name, mimeType)
+                return
+            }
+
+            val msg = e.message ?: "下载失败，请检查网络或存储空间"
+            val failed = _activeTasks.value[taskId]?.copy(
+                status = Status.ERROR,
+                error = msg,
+            )
+            if (failed != null) {
+                downloadTaskDao.insert(
+                    DownloadTaskEntity(
+                        name = name,
+                        status = "ERROR",
+                        error = msg,
+                        mimeType = mimeType,
+                    ),
+                )
+                _activeTasks.update { it - taskId }
+                _events.tryEmit(Event.Failed(failed, msg))
+            }
+        } finally {
+            cleanupTask(taskId)
+            dispatchNextTask()
+        }
+    }
+
+    private fun handleTaskCancelled(taskId: Long, name: String, mimeType: String?) {
+        _activeTasks.update { it - taskId }
+        cleanupTask(taskId)
+    }
+
+    private fun cleanupTask(taskId: Long) {
+        val jobs = taskJobs.get().toMutableMap()
+        jobs.remove(taskId)
+        taskJobs.set(jobs)
+
+        val flags = taskPauseFlags.get().toMutableMap()
+        flags.remove(taskId)
+        taskPauseFlags.set(flags)
+
+        val blocks = taskBlocks.get().toMutableMap()
+        blocks.remove(taskId)
+        taskBlocks.set(blocks)
+    }
+
+    private fun dispatchNextTask() {
+        scope.launch {
+            taskMutex.lock()
+            try {
+                val currentMax = maxConcurrentRef.get().toInt()
+                val runningCount = _activeTasks.value.values.count { it.status == Status.RUNNING }
+
+                if (runningCount < currentMax) {
+                    val nextTaskId = pendingQueue.removeFirstOrNull()
+                    if (nextTaskId != null) {
+                        startTask(nextTaskId)
+                    }
+                }
+            } finally {
+                taskMutex.unlock()
+            }
+        }
+    }
+
+    fun cancelTask(taskId: Long) {
+        scope.launch {
+            taskMutex.lock()
+            try {
+                pendingQueue.remove(taskId)
+                val job = taskJobs.get()[taskId]
+                job?.cancel()
+                cleanupTask(taskId)
+                _activeTasks.update { it - taskId }
+            } finally {
+                taskMutex.unlock()
+            }
         }
     }
 }

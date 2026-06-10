@@ -20,13 +20,11 @@ import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -59,13 +57,6 @@ class HomeViewModel @Inject constructor(
         started = SharingStarted.WhileSubscribed(5_000),
         initialValue = SettingsRepository.Settings(),
     )
-
-    // UiEvent 已废弃：跳转系统设置由 ViewModel 直接处理，避免 Hilt EntryPoint
-    // 在 Composable 文件里被 KSP 漏处理（ClassCastException on Android 15）。
-    @Deprecated("No longer emitted; ViewModel handles permission request directly.")
-    sealed interface UiEvent {
-        data object RequestStoragePermission : UiEvent
-    }
 
     /**
      * 批量解析后的单条结果。携带 rawUrl 作 id 方便勾选映射，
@@ -101,9 +92,6 @@ class HomeViewModel @Inject constructor(
 
     private val _uiState = MutableStateFlow(UiState())
     val uiState: StateFlow<UiState> = _uiState.asStateFlow()
-
-    private val _events = Channel<UiEvent>(Channel.BUFFERED)
-    val events = _events.receiveAsFlow()
 
     /**
      * 挂起的下载：用户在无权限状态点击下载时，把意图暂存；授权回来时由
@@ -220,10 +208,11 @@ class HomeViewModel @Inject constructor(
         val stem = TitleFormatter.formatFilenameStem(info.author, info.title)
         val filename = "$stem.mp4"
         val displayName = TitleFormatter.formatDisplayName(info.author, info.title)
-        submit(displayName, "video/mp4") { _, onProgress ->
-            downloadVideoUseCase(videoUrl, filename) { downloaded, total ->
+        val shareUrl = _uiState.value.inputUrl.takeIf { it.isNotEmpty() }
+        submit(displayName, "video/mp4") { _, onProgress, _ ->
+            downloadVideoUseCase(videoUrl, filename, onProgress = { downloaded, total ->
                 if (total != null) onProgress(downloaded, total)
-            }
+            }, shareUrl = shareUrl)
         }
     }
 
@@ -240,7 +229,7 @@ class HomeViewModel @Inject constructor(
             title = info?.title.orEmpty(),
             suffix = "_图${state.galleryIndex + 1}",
         )
-        submit(displayName, "image/*") { _, _ ->
+        submit(displayName, "image/*") { _, _, _ ->
             downloadImagesUseCase.downloadSingle(url, filename)
         }
     }
@@ -263,7 +252,7 @@ class HomeViewModel @Inject constructor(
             title = info?.title.orEmpty(),
             suffix = "_${total}张图",
         )
-        submit(displayName, "image/*") { _, onProgress ->
+        submit(displayName, "image/*") { _, onProgress, _ ->
             val uris = downloadImagesUseCase.downloadMultiple(urls, filenames) { completed, _ ->
                 val fraction = completed.toFloat() / total
                 onProgress((fraction * 1000).toLong(), 1000)
@@ -296,7 +285,7 @@ class HomeViewModel @Inject constructor(
             title = info?.title.orEmpty(),
             suffix = "_合成",
         )
-        submit(displayName, "video/mp4") { _, _ ->
+        submit(displayName, "video/mp4") { _, _, _ ->
             synthesizeVideoUseCase.fromImages(images, musicUrl, duration, filename)
         }
     }
@@ -313,7 +302,7 @@ class HomeViewModel @Inject constructor(
             title = info.title,
             suffix = "_合并",
         )
-        submit(displayName, "video/mp4") { _, _ ->
+        submit(displayName, "video/mp4") { _, _, _ ->
             synthesizeVideoUseCase.mergeWithMusic(videoUrl, info.musicUrl, filename)
         }
     }
@@ -489,19 +478,20 @@ class HomeViewModel @Inject constructor(
                 val stem = TitleFormatter.formatFilenameStem(info.author, info.title)
                 val filename = "$stem.mp4"
                 val displayName = TitleFormatter.formatDisplayName(info.author, info.title)
-                submit(displayName, "video/mp4") { _, onProgress ->
+                val shareUrl = item.rawUrl.takeIf { it.isNotEmpty() }
+                submit(displayName, "video/mp4") { _, onProgress, _ ->
                     val url = pickVideoUrl(info) { idx ->
                         if (idx in info.qualities.indices) idx else 0
                     }
-                    downloadVideoUseCase(url, filename) { downloaded, total ->
+                    downloadVideoUseCase(url, filename, onProgress = { downloaded, total ->
                         if (total != null) onProgress(downloaded, total)
-                    }
+                    }, shareUrl = shareUrl)
                 }
             }
             is ContentInfo.ImageGallery -> {
                 val stem = TitleFormatter.formatFilenameStem(info.author, info.title)
                 val displayName = TitleFormatter.formatDisplayName(info.author, info.title, suffix = "_${info.images.size}张图")
-                submit(displayName, "image/*") { _, onProgress ->
+                submit(displayName, "image/*") { _, onProgress, _ ->
                     val filenames = info.images.mapIndexed { i, _ -> "${stem}_图${i + 1}.jpg" }
                     val uris = downloadImagesUseCase.downloadMultiple(info.images, filenames) { c, _ ->
                         onProgress(c.toLong(), info.images.size.toLong())
@@ -513,7 +503,7 @@ class HomeViewModel @Inject constructor(
                 val stem = TitleFormatter.formatFilenameStem(info.author, info.title)
                 val filename = "${stem}_合成.mp4"
                 val displayName = TitleFormatter.formatDisplayName(info.author, info.title, suffix = "_合成")
-                submit(displayName, "video/mp4") { _, _ ->
+                submit(displayName, "video/mp4") { _, _, _ ->
                     synthesizeVideoUseCase.fromImages(info.images, info.musicUrl, info.duration, filename)
                 }
             }
@@ -552,11 +542,10 @@ class HomeViewModel @Inject constructor(
     private fun submit(
         name: String,
         mimeType: String?,
-        block: suspend (taskId: Long, onProgress: (Long, Long?) -> Unit) -> Uri?,
+        block: suspend (taskId: Long, onProgress: (Long, Long?) -> Unit, isPaused: () -> Boolean) -> Uri?,
     ) {
         if (!storagePermission.hasPermission()) {
             pendingDownload = { downloadManager.enqueue(name, mimeType, block) }
-            // 直接在 ViewModel 里跳系统设置页（@ApplicationContext 已注入）
             storagePermission.request(appContext)
             return
         }

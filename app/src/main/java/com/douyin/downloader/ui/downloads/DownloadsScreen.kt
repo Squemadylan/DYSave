@@ -172,7 +172,8 @@ private fun ActiveTaskCard(task: DownloadManager.Task) {
         ) {
             when (task.status) {
                 DownloadManager.Status.PENDING,
-                DownloadManager.Status.DOWNLOADING -> {
+                DownloadManager.Status.RUNNING,
+                DownloadManager.Status.PAUSED -> {
                     CircularProgressIndicator(
                         modifier = Modifier.size(40.dp),
                         strokeWidth = 3.dp,
@@ -207,7 +208,7 @@ private fun ActiveTaskCard(task: DownloadManager.Task) {
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 when (task.status) {
-                    DownloadManager.Status.DOWNLOADING -> {
+                    DownloadManager.Status.RUNNING -> {
                         if (task.progress != null) {
                             LinearProgressIndicator(
                                 progress = { task.progress },
@@ -232,6 +233,13 @@ private fun ActiveTaskCard(task: DownloadManager.Task) {
                     DownloadManager.Status.PENDING -> {
                         Text(
                             text = "等待中",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    DownloadManager.Status.PAUSED -> {
+                        Text(
+                            text = "已暂停",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )

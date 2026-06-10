@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">圆圆解析</string>
+
+    <!-- Bottom navigation -->
+    <string name="nav_home">解析</string>
+    <string name="nav_batch">批量</string>
+    <string name="nav_downloads">下载</string>
+    <string name="nav_history">历史</string>
+    <string name="nav_profile">我的</string>
+
+    <!-- Share intent -->
+    <string name="share_mime_type">text/plain</string>
+
+    <!-- Home screen -->
+    <string name="home_hero_title">把抖音链接粘到这里</string>
+    <string name="home_hero_subtitle">支持视频 / 图文 / 动图 · 无水印保存到 Downloads</string>
+    <string name="home_input_placeholder">https://v.douyin.com/...</string>
+    <string name="home_action_parse">解析</string>
+    <string name="home_action_paste">粘贴</string>
+    <string name="home_action_batch">一键批量</string>
+    <string name="home_loading">正在解析…</string>
+    <string name="home_error_parse">解析失败，请检查链接</string>
+    <string name="home_clipboard_detected">已从剪贴板读取链接</string>
+    <string name="home_history_title">最近解析</string>
+    <string name="home_history_empty_title">还没有解析记录</string>
+    <string name="home_history_empty_desc">粘贴一个抖音链接开始第一次下载吧</string>
+    <string name="home_history_count">%1$d 条</string>
+    <string name="home_type_video">视频</string>
+    <string name="home_type_image">图文</string>
+    <string name="home_type_animated">动图</string>
+    <string name="home_action_download_video">下载视频</string>
+    <string name="home_action_download_animated">下载动图</string>
+    <string name="home_action_synthesize">合成视频</string>
+    <string name="home_action_download_selected">下载选中 (%1$d)</string>
+    <string name="home_unnamed">未命名</string>
+
+    <!-- Common -->
+    <string name="common_back">返回</string>
+    <string name="common_clear">清除</string>
+    <string name="common_selected">已选</string>
+    <string name="common_unselected">未选</string>
+</resources>

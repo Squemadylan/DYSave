@@ -130,6 +130,87 @@ class DouyinApi @Inject constructor(private val client: OkHttpClient) {
     }
 
     /**
+     * 根据分享链接重新获取视频下载 URL（用于下载失败后重试）
+     * 返回最高清晰度的视频 URL
+     */
+    suspend fun refetchVideoUrl(shareUrl: String): String = withContext(Dispatchers.IO) {
+        try {
+            val pageUrl = resolveToShareablePage(shareUrl)
+            val html = fetchPage(pageUrl)
+            val awemeId = extractAwemeId(pageUrl) ?: extractAwemeId(shareUrl)
+                ?: throw Exception("无法提取视频 ID")
+
+            val videoUrl = extractVideoUrlFromHtml(html, awemeId)
+            if (videoUrl.isNotEmpty()) {
+                videoUrl
+            } else {
+                android.util.Log.w("DouyinApi", "无法从页面提取视频 URL")
+                ""
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("DouyinApi", "重新获取视频 URL 失败: ${e.message}")
+            ""
+        }
+    }
+
+    private fun extractVideoUrlFromHtml(html: String, awemeId: String): String {
+        try {
+            val start = html.indexOf("window._ROUTER_DATA")
+            if (start == -1) return ""
+            val jsonStart = html.indexOf('{', start)
+            if (jsonStart == -1) return ""
+            var depth = 0
+            val endIndex = buildString {
+                for (i in jsonStart until html.length) {
+                    val c = html[i]
+                    append(c)
+                    when (c) {
+                        '{' -> depth++
+                        '}' -> {
+                            depth--
+                            if (depth == 0) {
+                                return@buildString
+                            }
+                        }
+                    }
+                }
+            }.length + jsonStart - 1
+
+            val jsonStr = html.substring(jsonStart, endIndex + 1)
+                .replace("\\/", "/")
+                .replace("\\\"", "\"")
+                .replace("\\\\", "\\")
+
+            val videoUrl = Regex("""douyinvod\.com/[^"'\s]+""").find(jsonStr)?.value
+            if (!videoUrl.isNullOrEmpty()) {
+                return videoUrl
+            }
+
+            val playUrl = Regex("""play_addr[^}]*?url_list[^]]*?"([^"]+)""").find(jsonStr)?.groupValues?.get(1)
+            if (!playUrl.isNullOrEmpty()) {
+                return playUrl.replace("playwm", "play")
+            }
+
+            return ""
+        } catch (e: Exception) {
+            android.util.Log.e("DouyinApi", "提取视频 URL 失败: ${e.message}")
+            return ""
+        }
+    }
+
+    private fun extractAwemeId(url: String): String? {
+        val patterns = listOf(
+            Regex("""/video/(\d+)/?"""),
+            Regex("""aweme_id=(\d+)"""),
+            Regex("""(\d{17,19})"""),
+        )
+        for (pattern in patterns) {
+            pattern.find(url)?.let { return it.groupValues[1] }
+        }
+        return null
+    }
+
+    /**
      * 取一个令牌：保证两次请求至少间隔 MIN_INTERVAL_MS，
      * 并在 WAF 冷却期间 wait。
      */

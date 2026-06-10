@@ -11,7 +11,8 @@ class DownloadVideoUseCase @Inject constructor(
         videoUrl: String,
         filename: String = "douyin_video.mp4",
         onProgress: (Long, Long?) -> Unit = { _, _ -> },
+        shareUrl: String? = null,
     ): Uri {
-        return downloadRepo.saveVideoStream(videoUrl, filename, onProgress)
+        return downloadRepo.saveVideoStream(videoUrl, filename, onProgress, shareUrl)
     }
 }

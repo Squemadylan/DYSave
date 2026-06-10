@@ -7,9 +7,12 @@ import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import com.arthenica.ffmpegkit.FFmpegKit
+import com.douyin.downloader.data.model.DownloadException
+import com.douyin.downloader.data.model.ParseException
 import com.douyin.downloader.data.remote.DouyinApi
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.zip.ZipEntry
@@ -33,6 +36,9 @@ class DownloadRepository @Inject constructor(
          * Environment.getExternalStoragePublicDirectory() 显式创建。
          */
         val SUBDIR: String = Environment.DIRECTORY_DOWNLOADS + "/DYSave"
+
+        private const val MAX_DOWNLOAD_RETRIES = 3
+        private const val RETRY_DELAY_MS = 2000L
     }
 
     // ---------------------------------------------------------------------
@@ -50,13 +56,51 @@ class DownloadRepository @Inject constructor(
         videoUrl: String,
         filename: String,
         onProgress: (Long, Long?) -> Unit = { _, _ -> },
+        shareUrl: String? = null,
     ): Uri = withContext(Dispatchers.IO) {
-        val uri = createPendingItem(filename, "video/mp4")
-        context.contentResolver.openOutputStream(uri)?.use { output ->
-            api.streamTo(videoUrl, output, onProgress)
-        } ?: throw IllegalStateException("无法打开输出流：$uri")
-        finalize(uri)
-        uri
+        var currentUrl = videoUrl
+        var lastError: Exception? = null
+
+        for (attempt in 1..MAX_DOWNLOAD_RETRIES) {
+            try {
+                val uri = createPendingItem(filename, "video/mp4")
+                context.contentResolver.openOutputStream(uri)?.use { output ->
+                    api.streamTo(currentUrl, output, onProgress)
+                } ?: throw IllegalStateException("无法打开输出流：$uri")
+                finalize(uri)
+                return@withContext uri
+            } catch (e: Exception) {
+                lastError = e
+                val is403 = e.message?.contains("403") == true ||
+                    e.message?.contains("HTTP 403") == true ||
+                    e.message?.contains("Forbidden") == true
+
+                if (is403 && attempt < MAX_DOWNLOAD_RETRIES) {
+                    android.util.Log.w("DownloadRepository", "下载遇到 403，尝试重新获取视频链接 (尝试 $attempt/$MAX_DOWNLOAD_RETRIES)")
+                    delay(RETRY_DELAY_MS * attempt)
+
+                    if (shareUrl != null) {
+                        try {
+                            val newUrl = fetchFreshVideoUrl(shareUrl)
+                            if (newUrl.isNotEmpty()) {
+                                currentUrl = newUrl
+                                android.util.Log.d("DownloadRepository", "成功获取新的视频链接")
+                            }
+                        } catch (reparseError: Exception) {
+                            android.util.Log.w("DownloadRepository", "重新解析失败，继续使用原链接: ${reparseError.message}")
+                        }
+                    }
+                } else if (attempt < MAX_DOWNLOAD_RETRIES) {
+                    delay(RETRY_DELAY_MS * attempt)
+                }
+            }
+        }
+
+        throw lastError ?: DownloadException.DownloadFailed("下载失败，已重试 $MAX_DOWNLOAD_RETRIES 次")
+    }
+
+    private suspend fun fetchFreshVideoUrl(shareUrl: String): String {
+        return api.refetchVideoUrl(shareUrl)
     }
 
     suspend fun saveImage(bytes: ByteArray, filename: String): Uri = withContext(Dispatchers.IO) {
