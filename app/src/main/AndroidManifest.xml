@@ -1,0 +1,121 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Android 9 及以下写入公共下载目录需要 -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
+
+    <!-- Android 11+ 写入 MediaStore.Downloads 的 Downloads/DYSave/ 需要；
+         启动时会通过 ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION 引导用户授权 -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+
+    <!-- 抖音包名可见性（Android 11+ 必须） -->
+    <queries>
+        <package android:name="com.ss.android.ugc.aweme" />
+        <package android:name="com.ss.android.ugc.aweme.lite" />
+        <package android:name="com.ss.android.ugc.live" />
+    </queries>
+
+    <!-- 小红书包名可见性（Android 11+ 必须） -->
+    <queries>
+        <package android:name="com.xingin.xhs" />
+    </queries>
+
+    <!-- Shizuku：跨用户交互权限（debug only，provider 在 debug manifest 中声明） -->
+
+    <application
+        android:name=".App"
+        android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.DouyinDownloader"
+        tools:targetApi="31">
+
+        <!-- 禁用默认 WorkManager 初始化，由 App 提供 Hilt WorkerFactory -->
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:node="merge">
+            <meta-data
+                android:name="androidx.work.WorkManagerInitializer"
+                android:value="androidx.startup"
+                tools:node="remove" />
+        </provider>
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop">
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- 接收从抖音 app 分享的链接 -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity>
+
+        <!-- 小红书 WebView 登录获取 Cookie -->
+        <activity
+            android:name=".ui.profile.XhsLoginActivity"
+            android:exported="false"
+            android:launchMode="singleTop" />
+
+        <!-- 抖音 WebView 登录获取 Cookie（缓解 WAF / 限流） -->
+        <activity
+            android:name=".ui.profile.DouyinLoginActivity"
+            android:exported="false"
+            android:launchMode="singleTop" />
+
+        <!-- ShizukuProvider：仅在 debug 变体注入（通过 src/debug/AndroidManifest.xml） -->
+        <!-- provider 声明见 app/src/debug/AndroidManifest.xml，由 debugImplementation 驱动 -->
+
+        <!-- Shizuku UserService：以 shell 身份执行 run-as 读取 Cookie -->
+        <service
+            android:name=".data.remote.UserService"
+            android:exported="true"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
+
+        <!-- 抖音 OAuth 回调 Activity -->
+        <activity
+            android:name=".ui.auth.AuthCallbackActivity"
+            android:exported="true"
+            android:launchMode="singleTop">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="douyindownloader"
+                    android:host="auth" />
+            </intent-filter>
+        </activity>
+
+        <!-- FileProvider：让第三方 app 能打开/分享下载到私有目录的文件 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+    </application>
+</manifest>

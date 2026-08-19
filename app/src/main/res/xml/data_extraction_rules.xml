@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="dy_session.xml" />
+        <exclude domain="database" path="dy_history" />
+        <exclude domain="database" path="dy_history-shm" />
+        <exclude domain="database" path="dy_history-wal" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="dy_session.xml" />
+        <exclude domain="database" path="dy_history" />
+        <exclude domain="database" path="dy_history-shm" />
+        <exclude domain="database" path="dy_history-wal" />
+    </device-transfer>
+</data-extraction-rules>

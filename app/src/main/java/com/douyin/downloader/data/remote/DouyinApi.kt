@@ -1,0 +1,513 @@
+package com.douyin.downloader.data.remote
+
+import com.douyin.downloader.data.local.SettingsRepository
+import com.douyin.downloader.data.model.DownloadException
+import com.douyin.downloader.data.model.ParseException
+import com.douyin.downloader.util.MediaUrlNormalizer
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import java.io.ByteArrayOutputStream
+import java.util.concurrent.ConcurrentHashMap
+import javax.inject.Inject
+import javax.inject.Singleton
+
+@Singleton
+class DouyinApi @Inject constructor(
+    private val client: OkHttpClient,
+    private val cookieJar: MemoryCookieJar,
+    private val settings: SettingsRepository,
+) {
+
+    companion object {
+        const val USER_AGENT =
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) " +
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 " +
+                "Mobile/15E148 Safari/604.1"
+        // 兜底 UA：iOS 被风控时换 Android UA 再试一次
+        private const val USER_AGENT_ANDROID =
+            "Mozilla/5.0 (Linux; Android 13; Pixel 7) " +
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 " +
+                "Mobile Safari/537.36"
+        private const val REFERER = "https://www.douyin.com/"
+
+        // —— 限流 / 抗封配置 ——
+        // 令牌桶：平均 1.5 req/s（66ms/req），burst 5
+        private const val MIN_INTERVAL_MS = 700L
+        // 解析结果缓存：同一 aweme_id 5 分钟内复用
+        private const val PAGE_CACHE_TTL_MS = 5 * 60 * 1000L
+        // 检测到 WAF/黑名单后，全局冷却 30s（期间所有 fetchPage 直接 wait）
+        private const val WAF_COOLDOWN_MS = 30_000L
+        // 重试总退避上限
+        private const val MAX_BACKOFF_MS = 15_000L
+
+        /**
+         * 从 iesdouyin 页面 HTML 里挑出最终目标 id（video/ 数字 /）。
+         * 抖音 2026 之后 v.douyin.com 短链重定向到 www.douyin.com/aweme-share/video/{id}/
+         * 那个新页没有内嵌 _ROUTER_DATA（数据靠 JS 异步拉取，要 a_bogus 签名），
+         * 拿不到。退而求其次：把 aweme_id 抠出来，再去 iesdouyin.com/share/video/{id}/
+         * —— 那个老模板页 iOS UA 能稳定返回 _ROUTER_DATA。
+         */
+        private val AWEME_ID_REGEXES = listOf(
+            Regex("""/video/(\d{10,})"""),
+            Regex("""/note/(\d{10,})"""),
+            Regex("""item_ids=(\d{10,})"""),
+            Regex("""aweme_id[\\"'\s:=]+(\d{10,})"""),
+        )
+    }
+
+    // —— 限流状态（process 级，单例）——
+    private val rateMutex = Mutex()
+    @Volatile private var lastRequestAt: Long = 0L
+    // WAF 全局冷却截止时间（SystemClock.elapsedRealtime）
+    @Volatile private var wafCooldownUntil: Long = 0L
+    // 解析结果缓存：URL -> (html, expireAt)
+    private val pageCache = ConcurrentHashMap<String, Pair<String, Long>>()
+
+    // —— 用户 Cookie（缓解 WAF / 限流）——
+    // 从 SettingsRepository.flow 缓存最新值；变化时重新注入到 cookieJar。
+    @Volatile private var cachedDyCookie: String = ""
+    @Volatile private var seededCookie: String? = null
+    private val cookieScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    init {
+        cookieScope.launch {
+            settings.flow.collect { cachedDyCookie = it.douyinCookie }
+        }
+    }
+
+    /**
+     * 把用户填入的抖音 Cookie 注入共享 cookieJar（仅变化时执行）。
+     * 因 OkHttp BridgeInterceptor 会用 cookieJar 的 Cookie 覆盖手动设置的
+     * Cookie 头，所以必须走 cookieJar 注入，而非在 Request 上 header("Cookie", ...)。
+     */
+    private fun ensureCookieSeeded() {
+        val cookie = cachedDyCookie
+        if (cookie == seededCookie) return
+        if (cookie.isBlank()) {
+            cookieJar.clearDomain("douyin.com")
+            cookieJar.clearDomain("iesdouyin.com")
+            seededCookie = ""
+            return
+        }
+        val cookies = DouyinCookieHelper.parseToCookies(cookie)
+        cookieJar.saveFromResponse(douyinSeedUrl("www.douyin.com"), cookies)
+        cookieJar.saveFromResponse(douyinSeedUrl("www.iesdouyin.com"), cookies)
+        seededCookie = cookie
+    }
+
+    /**
+     * 从 www.douyin.com 短链重定向后的页里抠出 aweme_id（video 或 note）。
+     * 仅在重定向到 douyin.com 系列域名时调用。
+     */
+    internal fun extractAwemeIdFromFinalPage(html: String): String? {
+        for (r in AWEME_ID_REGEXES) {
+            r.find(html)?.let { return it.groupValues[1] }
+        }
+        return null
+    }
+
+    /**
+     * 跟随 v.douyin.com 短链跳转，返回最终页 URL。
+     */
+    suspend fun resolveShareUrl(url: String): String = withContext(Dispatchers.IO) {
+        ensureCookieSeeded()
+        acquireToken()
+        val request = Request.Builder()
+            .url(url)
+            .header("User-Agent", USER_AGENT)
+            .head()
+            .build()
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) throw ParseException.UrlResolveFailed("短链接跳转失败，HTTP ${response.code}")
+            response.request.url.toString()
+        }
+    }
+
+    /**
+     * 把任意抖音页 URL 转换成一个能在 iesdouyin 旧模板里取到 _ROUTER_DATA 的
+     * "可分享" 链接。
+     */
+    suspend fun resolveToShareablePage(url: String): String = withContext(Dispatchers.IO) {
+        // 1) 短链先跟随 redirect
+        val finalUrl = try {
+            if ("v.douyin.com" in url || "v.iesdouyin.com" in url) resolveShareUrl(url) else url
+        } catch (e: Exception) {
+            url
+        }
+
+        // 2) 已经是 iesdouyin 直接用
+        if ("iesdouyin.com" in finalUrl) return@withContext finalUrl
+
+        // 3) 拿 HTML 抠 aweme_id
+        ensureCookieSeeded()
+        acquireToken()
+        val request = Request.Builder()
+            .url(finalUrl)
+            .header("User-Agent", USER_AGENT)
+            .header("Referer", REFERER)
+            .build()
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) return@withContext finalUrl
+            val html = response.body?.string().orEmpty()
+            // 优先 canonical
+            val canonical = Regex("""<link[^>]+rel=["']canonical["'][^>]+href=["'](https?://[^"']+)""")
+                .find(html)?.groupValues?.get(1).orEmpty()
+            val id = extractAwemeIdFromFinalPage(canonical)
+                ?: extractAwemeIdFromFinalPage(finalUrl)
+                ?: extractAwemeIdFromFinalPage(html)
+            if (id != null) {
+                // 优先 video 模板（图集 note 也走 video 模板同源，HtmlParser 会再分流）
+                "https://www.iesdouyin.com/share/video/$id/"
+            } else {
+                finalUrl
+            }
+        }
+    }
+
+    /**
+     * 分享页 SSR 空壳时：用页内 webId + xsstoken 调 iteminfo 拉作品 JSON。
+     * @param shareHtml 已拉取的 iesdouyin HTML（避免重复请求）；为空则自行拉取。
+     */
+    suspend fun fetchItemInfo(awemeId: String, shareHtml: String? = null): String =
+        withContext(Dispatchers.IO) {
+            ensureCookieSeeded()
+            val pageUrl = "https://www.iesdouyin.com/share/video/$awemeId/"
+            val html = shareHtml?.takeIf { it.isNotBlank() } ?: fetchPage(pageUrl)
+            val webId = DouyinReflowToken.extractWebId(html)
+                ?: throw ParseException.ParseFailed("分享页未分配 webId，无法本地解析")
+            val xss = DouyinReflowToken.extractXssToken(html)
+                ?: throw ParseException.ParseFailed("分享页缺少 xsstoken，无法本地解析")
+            val reflowId = DouyinReflowToken.encrypt(webId, xss)
+
+            acquireToken()
+            val httpUrl = okhttp3.HttpUrl.Builder()
+                .scheme("https")
+                .host("www.iesdouyin.com")
+                .addPathSegments("web/api/v2/aweme/iteminfo/")
+                .addQueryParameter("item_ids", awemeId)
+                .addQueryParameter("reflow_source", "reflow_page")
+                .addQueryParameter("web_id", webId)
+                .addQueryParameter("device_id", webId)
+                .addQueryParameter("aid", "1128")
+                .addQueryParameter("reflow_id", reflowId)
+                .build()
+            val request = Request.Builder()
+                .url(httpUrl)
+                .header("User-Agent", USER_AGENT)
+                .header("Referer", "https://www.iesdouyin.com/")
+                .header("Content-Type", "application/json")
+                .header("Agw-Js-Conv", "str")
+                .build()
+            client.newCall(request).execute().use { response ->
+                val body = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    throw ParseException.PageFetchFailed("iteminfo 失败，HTTP ${response.code}")
+                }
+                if (body.isBlank()) {
+                    throw ParseException.PageFetchFailed("iteminfo 返回空（可能被限流）")
+                }
+                android.util.Log.d(
+                    "DouyinApi",
+                    "iteminfo awemeId=$awemeId http=${response.code} len=${body.length}",
+                )
+                body
+            }
+        }
+
+    /**
+     * 根据分享链接重新获取视频下载 URL（用于下载失败后重试）
+     * 返回最高清晰度的视频 URL
+     */
+    suspend fun refetchVideoUrl(shareUrl: String): String = withContext(Dispatchers.IO) {
+        try {
+            val pageUrl = resolveToShareablePage(shareUrl)
+            val html = fetchPage(pageUrl)
+            val awemeId = extractAwemeId(pageUrl) ?: extractAwemeId(shareUrl)
+                ?: throw Exception("无法提取视频 ID")
+
+            val fromHtml = extractVideoUrlFromHtml(html, awemeId)
+            if (fromHtml.isNotEmpty()) return@withContext fromHtml
+
+            // SSR 空壳时走 iteminfo
+            val itemInfo = fetchItemInfo(awemeId, html)
+            val playMatch = Regex(""""(https?://[^"\\]*playwm[^"\\]*)"""").find(itemInfo)
+            playMatch?.groupValues?.get(1)?.replace("playwm", "play").orEmpty().ifEmpty {
+                android.util.Log.w("DouyinApi", "无法从页面/iteminfo 提取视频 URL")
+                ""
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("DouyinApi", "重新获取视频 URL 失败: ${e.message}")
+            ""
+        }
+    }
+
+    private fun extractVideoUrlFromHtml(html: String, awemeId: String): String {
+        try {
+            val start = html.indexOf("window._ROUTER_DATA")
+            if (start == -1) return ""
+            val jsonStart = html.indexOf('{', start)
+            if (jsonStart == -1) return ""
+            var depth = 0
+            val endIndex = buildString {
+                for (i in jsonStart until html.length) {
+                    val c = html[i]
+                    append(c)
+                    when (c) {
+                        '{' -> depth++
+                        '}' -> {
+                            depth--
+                            if (depth == 0) {
+                                return@buildString
+                            }
+                        }
+                    }
+                }
+            }.length + jsonStart - 1
+
+            val jsonStr = html.substring(jsonStart, endIndex + 1)
+                .replace("\\/", "/")
+                .replace("\\\"", "\"")
+                .replace("\\\\", "\\")
+
+            val videoUrl = Regex("""douyinvod\.com/[^"'\s]+""").find(jsonStr)?.value
+            if (!videoUrl.isNullOrEmpty()) {
+                return videoUrl
+            }
+
+            val playUrl = Regex("""play_addr[^}]*?url_list[^]]*?"([^"]+)""").find(jsonStr)?.groupValues?.get(1)
+            if (!playUrl.isNullOrEmpty()) {
+                return playUrl.replace("playwm", "play")
+            }
+
+            return ""
+        } catch (e: Exception) {
+            android.util.Log.e("DouyinApi", "提取视频 URL 失败: ${e.message}")
+            return ""
+        }
+    }
+
+    private fun extractAwemeId(url: String): String? {
+        val patterns = listOf(
+            Regex("""/video/(\d+)/?"""),
+            Regex("""aweme_id=(\d+)"""),
+            Regex("""(\d{17,19})"""),
+        )
+        for (pattern in patterns) {
+            pattern.find(url)?.let { return it.groupValues[1] }
+        }
+        return null
+    }
+
+    /**
+     * 取一个令牌：保证两次请求至少间隔 MIN_INTERVAL_MS，
+     * 并在 WAF 冷却期间 wait。
+     */
+    private suspend fun acquireToken() {
+        rateMutex.withLock {
+            val now = android.os.SystemClock.elapsedRealtime()
+            // 1) WAF 冷却：等到截止时间
+            if (wafCooldownUntil > now) {
+                val wait = wafCooldownUntil - now
+                android.util.Log.w("DouyinApi", "WAF 冷却中，wait ${wait}ms")
+                delay(wait)
+            }
+            // 2) 速率限制：两次请求至少 MIN_INTERVAL_MS
+            val sinceLast = now - lastRequestAt
+            if (lastRequestAt > 0 && sinceLast < MIN_INTERVAL_MS) {
+                delay(MIN_INTERVAL_MS - sinceLast)
+            }
+            lastRequestAt = android.os.SystemClock.elapsedRealtime()
+        }
+    }
+
+    /**
+     * 检测响应内容是否被 WAF 拦截或被换成了"空壳"页（缺 _ROUTER_DATA）。
+     * 注意：iesdouyin 旧模板 200 OK 但不含 _ROUTER_DATA = 服务端拒绝/限流。
+     */
+    private fun looksLikeWafBlock(html: String): Boolean {
+        if (html.isEmpty()) return true
+        if (html.contains("WAFJS") || html.contains("out-sha256") || html.contains("acrawler")) {
+            return true
+        }
+        // 200 OK 但没有 _ROUTER_DATA 且长度短 = 限流空壳页
+        if (!html.contains("_ROUTER_DATA") && html.length < 50_000) {
+            return true
+        }
+        return false
+    }
+
+    private fun markWafCooldown() {
+        val until = android.os.SystemClock.elapsedRealtime() + WAF_COOLDOWN_MS
+        wafCooldownUntil = until
+        android.util.Log.w("DouyinApi", "检测到 WAF 限流，全局冷却 ${WAF_COOLDOWN_MS}ms")
+    }
+
+    /**
+     * 拉取 HTML 页面，带：
+     *  - 5 分钟内同 URL 复用
+     *  - 全局令牌桶限流 1.5 req/s
+     *  - 指数退避重试（第 2 次换 Android UA 兜底）
+     *  - 命中 WAF 自动全局冷却
+     */
+    suspend fun fetchPage(url: String): String = withContext(Dispatchers.IO) {
+        ensureCookieSeeded()
+        // 1) 缓存命中
+        pageCache[url]?.let { (cached, expireAt) ->
+            if (expireAt > android.os.SystemClock.elapsedRealtime()) {
+                return@withContext cached
+            } else {
+                pageCache.remove(url)
+            }
+        }
+
+        // 2) 重试循环（最多 3 次，指数退避 0/2/4s，封顶 15s）
+        val backoffsMs = longArrayOf(0L, 2_000L, 4_000L)
+        val uas = arrayOf(USER_AGENT, USER_AGENT_ANDROID, USER_AGENT)
+        var lastError: Exception? = null
+        for (attempt in backoffsMs.indices) {
+            if (backoffsMs[attempt] > 0L) {
+                delay(backoffsMs[attempt])
+            }
+            try {
+                acquireToken()
+                val html = fetchPageOnce(url, uas[attempt])
+                // WAF 命中检测：触发全局冷却 + 不写缓存
+                if (looksLikeWafBlock(html)) {
+                    markWafCooldown()
+                    lastError = ParseException.PageFetchFailed("页面被 WAF 限流（_ROUTER_DATA 缺失）")
+                    android.util.Log.w(
+                        "DouyinApi",
+                        "fetchPage WAF 命中 attempt=${attempt + 1}/${backoffsMs.size} url=$url len=${html.length}",
+                    )
+                    continue
+                }
+                // 成功：写缓存
+                pageCache[url] = html to (android.os.SystemClock.elapsedRealtime() + PAGE_CACHE_TTL_MS)
+                if (attempt > 0) {
+                    android.util.Log.d(
+                        "DouyinApi",
+                        "fetchPage 重试成功 attempt=${attempt + 1} ua=${
+                            if (uas[attempt] == USER_AGENT) "iOS" else "Android"
+                        } url=$url",
+                    )
+                }
+                return@withContext html
+            } catch (e: ParseException.PageFetchFailed) {
+                lastError = e
+                android.util.Log.w(
+                    "DouyinApi",
+                    "fetchPage 失败 attempt=${attempt + 1}/${backoffsMs.size} ua=${
+                        if (uas[attempt] == USER_AGENT) "iOS" else "Android"
+                    } url=$url err=${e.message}",
+                )
+            }
+        }
+        throw lastError ?: ParseException.PageFetchFailed("页面加载失败")
+    }
+
+    private fun fetchPageOnce(url: String, userAgent: String): String {
+        val request = Request.Builder()
+            .url(url)
+            .header("User-Agent", userAgent)
+            .header("Referer", REFERER)
+            .build()
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                throw ParseException.PageFetchFailed("页面加载失败，HTTP ${response.code}，链接可能已失效")
+            }
+            val html = response.body?.string() ?: throw ParseException.PageFetchFailed("页面返回内容为空")
+            val hasRouter = html.contains("_ROUTER_DATA")
+            val hasWaf = html.contains("WAFJS") || html.contains("out-sha256")
+            android.util.Log.d(
+                "DouyinApi",
+                "fetchPage url=$url ua=${
+                    if (userAgent == USER_AGENT) "iOS" else "Android"
+                } len=${html.length} _ROUTER_DATA=$hasRouter waf=$hasWaf",
+            )
+            return html
+        }
+    }
+
+    suspend fun downloadBytes(url: String, timeoutSeconds: Int = 30): ByteArray =
+        withContext(Dispatchers.IO) {
+            val request = Request.Builder()
+                .url(MediaUrlNormalizer.preferHttps(url))
+                .header("User-Agent", USER_AGENT)
+                .header("Referer", REFERER)
+                .build()
+            client.newBuilder()
+                .connectTimeout(timeoutSeconds.toLong(), java.util.concurrent.TimeUnit.SECONDS)
+                .readTimeout(timeoutSeconds.toLong(), java.util.concurrent.TimeUnit.SECONDS)
+                .build()
+                .newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) throw DownloadException.DownloadFailed("文件下载失败，HTTP ${response.code}")
+                    response.body?.bytes() ?: throw DownloadException.DownloadFailed("文件内容为空")
+                }
+        }
+
+    suspend fun downloadWithProgress(
+        url: String,
+        onProgress: (downloaded: Long, total: Long?) -> Unit,
+    ): ByteArray = withContext(Dispatchers.IO) {
+        val request = Request.Builder()
+            .url(MediaUrlNormalizer.preferHttps(url))
+            .header("User-Agent", USER_AGENT)
+            .header("Referer", REFERER)
+            .build()
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) throw DownloadException.DownloadFailed("文件下载失败，HTTP ${response.code}")
+            val body = response.body ?: throw DownloadException.DownloadFailed("文件内容为空")
+            val total = body.contentLength().takeIf { it != -1L }
+            val input = body.byteStream()
+            val output = ByteArrayOutputStream()
+            val buffer = ByteArray(8192)
+            var downloaded = 0L
+            var read: Int
+            while (input.read(buffer).also { read = it } != -1) {
+                output.write(buffer, 0, read)
+                downloaded += read
+                onProgress(downloaded, total)
+            }
+            output.toByteArray()
+        }
+    }
+
+    suspend fun streamTo(
+        url: String,
+        output: java.io.OutputStream,
+        onProgress: (downloaded: Long, total: Long?) -> Unit = { _, _ -> },
+    ): Long = withContext(Dispatchers.IO) {
+        val request = Request.Builder()
+            .url(MediaUrlNormalizer.preferHttps(url))
+            .header("User-Agent", USER_AGENT)
+            .header("Referer", REFERER)
+            .build()
+        client.newBuilder()
+            .readTimeout(120, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+            .newCall(request).execute().use { response ->
+                if (!response.isSuccessful) throw DownloadException.DownloadFailed("视频流下载失败，HTTP ${response.code}")
+                val body = response.body ?: throw DownloadException.DownloadFailed("视频流为空")
+                val total = body.contentLength().takeIf { it != -1L }
+                val input = body.byteStream()
+                val buffer = ByteArray(8192)
+                var downloaded = 0L
+                var read: Int
+                while (input.read(buffer).also { read = it } != -1) {
+                    output.write(buffer, 0, read)
+                    downloaded += read
+                    onProgress(downloaded, total)
+                }
+                downloaded
+            }
+    }
+}

@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 短视频 CDN 偶发仅提供 http；允许明文作兜底（优先仍走 https 升级）。 -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>
